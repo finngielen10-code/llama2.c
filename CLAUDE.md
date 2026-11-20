@@ -12,7 +12,14 @@ Fork of karpathy/llama2.c used to speed up `run.c` inference on Windows.
 gcc -O3 -fopenmp -march=native -fpermissive run.c win.c -lm -o run.exe
 ./run.exe stories15M.bin -s 42
 ```
-`win.c`/`win.h` provide mmap/clock shims for Windows (`clock_gettime` was renamed to `win_clock_gettime` locally to avoid clashing with the MinGW one).
+`win.c`/`win.h` provide mmap/clock shims for Windows (`clock_gettime` was renamed to `win_clock_gettime` to avoid clashing with the MinGW one; `run.c`/`runq.c` call `win_clock_gettime` on `_WIN32`).
+
+### Portability (upstream CI builds)
+The fast paths are compile-time optional, so every Makefile target and `build_msvc.bat` still build:
+- `USE_AVX2` (needs `__AVX2__` and `__FMA__`, i.e. `-march=native`): SIMD kernels; otherwise plain-C kernels that match the original output exactly.
+- `USE_POOL` (C11 atomics, i.e. not MSVC): spin-wait thread pool; otherwise everything runs on the calling thread. The pool uses pthreads, or `CreateThread` on Windows (MinGW then needs no `-lpthread`).
+- OpenMP is optional: without `-fopenmp` the core count comes from `sysconf`/`GetSystemInfo`.
+- No VLAs (MSVC): the RoPE tables live in `RunState`.
 
 ## Optimization rules
 - The compile command above is fixed: don't rely on extra flags (no `-ffast-math`); put tunables in `run.c` as `#define`s with `#ifndef` guards.
@@ -39,6 +46,14 @@ Result: ~131 → **~640 tok/s** median on stories15M (~4.9×), `-s 42` output by
   - Temperature 1.0 skips the divide-by-temperature pass (dividing by 1.0f changes nothing).
   - `sample_topp` first tries higher probability cutoffs, so it sorts only a few hundred tokens instead of thousands. It falls back to the original cutoff, so the result is the same.
 - **Windows only** (`set_high_qos`): turns off power throttling for the pool's threads so Windows 11 keeps them on P-cores. This gave ~624 → ~650 tok/s. It is compiled out on other platforms.
+
+## Optional 8-bit mode (`-q 1`)
+- Off by default; the default path calls the same float kernel as before, so `-s 42` output is unchanged.
+- At load, all weights are quantized "Q8_0" style: groups of 32 (`Q8_GS`, must be 32) as int8 in [-127,127] plus a float scale. The int8 copy mirrors the float region element by element, so `matmul_rows_q8` finds a matrix's int8 copy by its float pointer's offset.
+- Each matmul input is quantized once (`mm_prep`) before its pool job; `mm_rows` picks the float or int8 kernel. The dot product uses AVX-VNNI `dpbusd` when available, else `maddubs`+`madd`.
+- Only matmuls change; attention, norms and the embedding lookup stay float.
+- Real stories15M on a Linux cloud Xeon (4 cores), `-s 42`, 11 interleaved runs: ~910 → ~1900 tok/s median (~2.1×).
+- Quality: when both modes are fed the same 256-token story, 8-bit picks the same top next token 98.8% of the time (252/255). Average log-prob of the story is -0.367 vs -0.364 for float. Stories read just as well, but they branch off from the float story after a few dozen tokens, so the output can't be checked against `tests/ref_s42.txt`.
 
 ## Findings
 - Original was ~131 tok/s with 8 threads but 83 tok/s single-threaded: the scalar matmul wasn't vectorized, and OpenMP overhead was large.
