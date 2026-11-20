@@ -1,0 +1,6 @@
+*.exe
+*.bin
+!tokenizer.bin
+build/
+.claude/data/
+.claude/settings.local.json
