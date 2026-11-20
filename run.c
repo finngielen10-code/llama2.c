@@ -279,6 +279,118 @@ static void matmul_rows(float* xout, const float* x, const float* w, int n, int 
     }
 }
 
+// ----------------------------------------------------------------------------
+// Optional 8-bit mode (-q 1). Off by default, so the default output is unchanged.
+// At load, the weights are quantized in groups of Q8_GS values: int8 in [-127,127]
+// plus one float scale per group ("Q8_0"). The int8 copy mirrors the float weight
+// region element by element, so a float weight pointer maps to its int8 copy by
+// offset. The input vector of each matmul is quantized the same way, the dot
+// products run in int8/int32, and each group's sum is scaled back to float.
+// About 3.5x less weight memory traffic per token; output is close to, but not
+// bit-identical with, the float path.
+
+#ifndef Q8_GS
+#define Q8_GS 32
+#endif
+#if Q8_GS != 32
+#error "the AVX2 int8 kernel handles exactly one 32-byte group per step: Q8_GS must be 32"
+#endif
+
+static int g_quant = 0;                // set by -q 1
+static const float* q8_fbase;          // start of the float weights
+static int8_t* q8_w;                   // int8 weights, same layout as q8_fbase
+static float* q8_ws;                   // one scale per Q8_GS weights
+static int8_t* q8_x;                   // current matmul input, quantized
+static float* q8_xs;                   // its scales
+
+static void q8_quantize(int8_t* q, float* s, const float* x, size_t n) {
+    for (size_t g = 0; g < n / Q8_GS; g++) {
+        const float* xg = x + g * Q8_GS;
+        float amax = 0.0f;
+        for (int i = 0; i < Q8_GS; i++) { float a = fabsf(xg[i]); if (a > amax) amax = a; }
+        float scale = amax / 127.0f;
+        float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
+        s[g] = scale;
+        for (int i = 0; i < Q8_GS; i++) q[g * Q8_GS + i] = (int8_t)lrintf(xg[i] * inv);
+    }
+}
+
+// quantize all float weights (n_floats of them, starting at base); returns 0 if unsupported
+static int q8_init(const float* base, size_t n_floats, int dim, int hidden_dim) {
+    if (dim % Q8_GS || hidden_dim % Q8_GS) return 0;
+    n_floats -= n_floats % Q8_GS;
+    q8_fbase = base;
+    q8_w = malloc(n_floats);
+    q8_ws = malloc(n_floats / Q8_GS * sizeof(float));
+    int maxn = dim > hidden_dim ? dim : hidden_dim;
+    q8_x = malloc(maxn);
+    q8_xs = malloc(maxn / Q8_GS * sizeof(float));
+    if (!q8_w || !q8_ws || !q8_x || !q8_xs) return 0;
+    size_t chunk = (size_t)Q8_GS * 4096;
+    #pragma omp parallel for schedule(dynamic)
+    for (long long c = 0; c < (long long)((n_floats + chunk - 1) / chunk); c++) {
+        size_t o = (size_t)c * chunk, len = n_floats - o < chunk ? n_floats - o : chunk;
+        q8_quantize(q8_w + o, q8_ws + o / Q8_GS, base + o, len);
+    }
+    return 1;
+}
+
+// sum of 32 int8 products a[i]*b[i], as 8 int32 lanes
+static inline __m256i q8_dot32(__m256i a, __m256i b) {
+    __m256i ua = _mm256_sign_epi8(a, a);   // |a|, fits u8 since a >= -127
+    __m256i sb = _mm256_sign_epi8(b, a);   // b with a's sign
+#if defined __AVXVNNI__
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ua, sb);
+#elif defined __AVX512VNNI__ && defined __AVX512VL__
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), ua, sb);
+#else
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(ua, sb), _mm256_set1_epi16(1));
+#endif
+}
+
+// rows [r0, r1) of W (d,n) @ x, using the int8 copy of w and the quantized input q8_x
+static void matmul_rows_q8(float* xout, const float* w, int n, int r0, int r1) {
+    size_t off = (size_t)(w - q8_fbase);
+    const int8_t* wq = q8_w + off;
+    const float* wsc = q8_ws + off / Q8_GS;
+    int ng = n / Q8_GS;
+    int i = r0;
+    for (; i + 4 <= r1; i += 4) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const int8_t* w0 = wq + (size_t)i * n;
+        const float* s0 = wsc + (size_t)i * ng;
+        for (int g = 0; g < ng; g++) {
+            __m256i xv = _mm256_loadu_si256((const __m256i*)(q8_x + g * Q8_GS));
+            float xs = q8_xs[g];
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q8_dot32(_mm256_loadu_si256((const __m256i*)(w0 + g * Q8_GS)), xv)), _mm256_set1_ps(s0[g] * xs), a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q8_dot32(_mm256_loadu_si256((const __m256i*)(w0 + n + g * Q8_GS)), xv)), _mm256_set1_ps(s0[ng + g] * xs), a1);
+            a2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q8_dot32(_mm256_loadu_si256((const __m256i*)(w0 + 2 * n + g * Q8_GS)), xv)), _mm256_set1_ps(s0[2 * ng + g] * xs), a2);
+            a3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q8_dot32(_mm256_loadu_si256((const __m256i*)(w0 + 3 * n + g * Q8_GS)), xv)), _mm256_set1_ps(s0[3 * ng + g] * xs), a3);
+        }
+        xout[i] = hsum256(a0); xout[i+1] = hsum256(a1); xout[i+2] = hsum256(a2); xout[i+3] = hsum256(a3);
+    }
+    for (; i < r1; i++) {
+        float val = 0.0f;
+        for (int g = 0; g < ng; g++) {
+            int sum = 0;
+            for (int k = 0; k < Q8_GS; k++) sum += wq[(size_t)i * n + g * Q8_GS + k] * q8_x[g * Q8_GS + k];
+            val += sum * wsc[(size_t)i * ng + g] * q8_xs[g];
+        }
+        xout[i] = val;
+    }
+}
+
+// call before dispatching a matmul job on input x: quantizes x in 8-bit mode
+static inline void mm_prep(const float* x, int n) {
+    if (g_quant) q8_quantize(q8_x, q8_xs, x, n);
+}
+// rows [r0, r1) of W @ x, in whichever mode is active (x must have gone through mm_prep)
+static inline void mm_rows(float* xout, const float* x, const float* w, int n, int r0, int r1) {
+    if (g_quant) matmul_rows_q8(xout, w, n, r0, r1);
+    else matmul_rows(xout, x, w, n, r0, r1);
+}
+
 // generic job: ntasks independent tasks, claimed dynamically by the caller and the workers
 typedef void (*pool_task_fn)(void* ctx, int task);
 static pool_task_fn pool_fn;
@@ -369,14 +481,15 @@ static void matmul_task(void* ctx, int task) {
     const MatmulJob* j = (const MatmulJob*)ctx;
     int r0 = task * POOL_CHUNK_ROWS;
     int r1 = r0 + POOL_CHUNK_ROWS < j->d ? r0 + POOL_CHUNK_ROWS : j->d;
-    matmul_rows(j->xout, j->x, j->w, j->n, r0, r1);
+    mm_rows(j->xout, j->x, j->w, j->n, r0, r1);
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
+    mm_prep(x, n);
     if (pool_nthreads <= 1 || (size_t)d * n < POOL_MIN_WORK) {
-        matmul_rows(xout, x, w, n, 0, d);
+        mm_rows(xout, x, w, n, 0, d);
         return;
     }
     MatmulJob job = { xout, x, w, n, d };
@@ -392,11 +505,12 @@ static void multi_matmul_task(void* ctx, int task) {
     while (task >= j->first_task[m + 1]) m++;
     int r0 = (task - j->first_task[m]) * POOL_CHUNK_ROWS;
     int r1 = r0 + POOL_CHUNK_ROWS < j->d[m] ? r0 + POOL_CHUNK_ROWS : j->d[m];
-    matmul_rows(j->out[m], j->x, j->w[m], j->n, r0, r1);
+    mm_rows(j->out[m], j->x, j->w[m], j->n, r0, r1);
 }
 
 // xout_k = W_k (d_k,n) @ x for k < nmat (nmat <= 3)
 static void matmul_multi(int nmat, const float* x, int n, float** outs, float** ws, const int* ds) {
+    mm_prep(x, n);
     MultiMatmulJob j; j.x = x; j.n = n; j.nmat = nmat; j.first_task[0] = 0;
     for (int m = 0; m < nmat; m++) {
         j.out[m] = outs[m]; j.w[m] = ws[m]; j.d[m] = ds[m];
@@ -412,8 +526,8 @@ static void ffn_up_task(void* ctx, int task) {
     const FfnUpJob* j = (const FfnUpJob*)ctx;
     int r0 = task * POOL_CHUNK_ROWS;
     int r1 = r0 + POOL_CHUNK_ROWS < j->d ? r0 + POOL_CHUNK_ROWS : j->d;
-    matmul_rows(j->hb, j->x, j->w1, j->n, r0, r1);
-    matmul_rows(j->hb2, j->x, j->w3, j->n, r0, r1);
+    mm_rows(j->hb, j->x, j->w1, j->n, r0, r1);
+    mm_rows(j->hb2, j->x, j->w3, j->n, r0, r1);
     // SwiGLU non-linearity
     for (int i = r0; i < r1; i++) {
         float val = j->hb[i];
@@ -551,6 +665,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         // fused with the SwiGLU non-linearity, as one pool job
+        mm_prep(s->xb, dim);
         FfnUpJob ffn = { s->hb, s->hb2, s->xb, w->w1 + l*dim*hidden_dim, w->w3 + l*dim*hidden_dim, dim, hidden_dim };
         pool_parallel_for(ffn_up_task, &ffn, (hidden_dim + POOL_CHUNK_ROWS - 1) / POOL_CHUNK_ROWS);
 
@@ -1170,6 +1285,7 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -q <int>    1 = 8-bit weights: faster, output differs slightly. default 0\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1185,6 +1301,7 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    int quant = 0;              // 1 = 8-bit weights (faster, output differs slightly)
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -1202,6 +1319,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'q') { quant = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
 
@@ -1214,6 +1332,12 @@ int main(int argc, char *argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    if (quant) {
+        const float* wbase = transformer.data + sizeof(Config) / sizeof(float);
+        size_t nf = (size_t)transformer.file_size / sizeof(float) - sizeof(Config) / sizeof(float);
+        g_quant = q8_init(wbase, nf, transformer.config.dim, transformer.config.hidden_dim);
+        if (!g_quant) fprintf(stderr, "8-bit mode not supported for this model, using float\n");
+    }
     pool_init();
     if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // override to ~max length
 

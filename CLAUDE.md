@@ -40,6 +40,13 @@ Result: ~131 → **~640 tok/s** median on stories15M (~4.9×), `-s 42` output by
   - `sample_topp` first tries higher probability cutoffs, so it sorts only a few hundred tokens instead of thousands. It falls back to the original cutoff, so the result is the same.
 - **Windows only** (`set_high_qos`): turns off power throttling for the pool's threads so Windows 11 keeps them on P-cores. This gave ~624 → ~650 tok/s. It is compiled out on other platforms.
 
+## Optional 8-bit mode (`-q 1`)
+- Off by default; the default path calls the same float kernel as before, so `-s 42` output is unchanged.
+- At load, all weights are quantized "Q8_0" style: groups of 32 (`Q8_GS`, must be 32) as int8 in [-127,127] plus a float scale. The int8 copy mirrors the float region element by element, so `matmul_rows_q8` finds a matrix's int8 copy by its float pointer's offset.
+- Each matmul input is quantized once (`mm_prep`) before its pool job; `mm_rows` picks the float or int8 kernel. The dot product uses AVX-VNNI `dpbusd` when available, else `maddubs`+`madd`.
+- Only matmuls change; attention, norms and the embedding lookup stay float.
+- Linux Xeon, random weights shaped like stories15M: ~920 → ~1700 tok/s (~1.8×). Logits differ from float by ~2% (relative L2), and the top token matched in the tested positions. Output text differs from the float run, so it can't be checked against `tests/ref_s42.txt`.
+
 ## Findings
 - Original was ~131 tok/s with 8 threads but 83 tok/s single-threaded: the scalar matmul wasn't vectorized, and OpenMP overhead was large.
 - The classifier matmul (32000 × 288) is ~45% of the time and runs close to DRAM bandwidth (~74 GB/s). Further big gains need smaller weights (e.g. int8 quantization, see `runq.c`), which changes the output.
