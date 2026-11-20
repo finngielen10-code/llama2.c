@@ -12,7 +12,14 @@ Fork of karpathy/llama2.c used to speed up `run.c` inference on Windows.
 gcc -O3 -fopenmp -march=native -fpermissive run.c win.c -lm -o run.exe
 ./run.exe stories15M.bin -s 42
 ```
-`win.c`/`win.h` provide mmap/clock shims for Windows (`clock_gettime` was renamed to `win_clock_gettime` locally to avoid clashing with the MinGW one).
+`win.c`/`win.h` provide mmap/clock shims for Windows (`clock_gettime` was renamed to `win_clock_gettime` to avoid clashing with the MinGW one; `run.c`/`runq.c` call `win_clock_gettime` on `_WIN32`).
+
+### Portability (upstream CI builds)
+The fast paths are compile-time optional, so every Makefile target and `build_msvc.bat` still build:
+- `USE_AVX2` (needs `__AVX2__` and `__FMA__`, i.e. `-march=native`): SIMD kernels; otherwise plain-C kernels that match the original output exactly.
+- `USE_POOL` (C11 atomics, i.e. not MSVC): spin-wait thread pool; otherwise everything runs on the calling thread. The pool uses pthreads, or `CreateThread` on Windows (MinGW then needs no `-lpthread`).
+- OpenMP is optional: without `-fopenmp` the core count comes from `sysconf`/`GetSystemInfo`.
+- No VLAs (MSVC): the RoPE tables live in `RunState`.
 
 ## Optimization rules
 - The compile command above is fixed: don't rely on extra flags (no `-ffast-math`); put tunables in `run.c` as `#define`s with `#ifndef` guards.

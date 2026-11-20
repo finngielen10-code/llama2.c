@@ -7,16 +7,49 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#include <immintrin.h>
-#include <omp.h>
-#include <pthread.h>
-#include <sched.h>
-#include <stdatomic.h>
+#include <stdint.h>
 #if defined _WIN32
     #include "win.h"
 #else
     #include <unistd.h>
     #include <sys/mman.h>
+#endif
+
+// Portability switches. The fast paths need: AVX2+FMA (-march=native on x86) for the
+// SIMD kernels, and C11 atomics + threads (gcc/clang) for the thread pool. Builds
+// without them (plain `make`, MSVC, ARM) use the plain-C kernels / run single-threaded.
+#if defined __AVX2__ && defined __FMA__
+    #define USE_AVX2 1
+#else
+    #define USE_AVX2 0
+#endif
+#ifndef USE_POOL
+    #if defined _MSC_VER || defined __STDC_NO_ATOMICS__
+        #define USE_POOL 0
+    #else
+        #define USE_POOL 1
+    #endif
+#endif
+#if defined __x86_64__ || defined __i386__ || defined _M_X64 || defined _M_IX86
+    #include <immintrin.h>
+    #define CPU_RELAX() _mm_pause()
+#elif defined __aarch64__ || defined __arm__
+    #define CPU_RELAX() __asm__ __volatile__("yield")
+#else
+    #define CPU_RELAX() ((void)0)
+#endif
+#ifdef _OPENMP
+    #include <omp.h>
+#endif
+#if USE_POOL
+    #include <stdatomic.h>
+    #if defined _WIN32
+        #define POOL_YIELD() SwitchToThread()
+    #else
+        #include <pthread.h>
+        #include <sched.h>
+        #define POOL_YIELD() sched_yield()
+    #endif
 #endif
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -64,6 +97,7 @@ typedef struct {
     float *v; // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
+    float *rope_cos, *rope_sin; // RoPE factors for the current position (head_size/2,)
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -92,9 +126,12 @@ void malloc_run_state(RunState* s, Config* p) {
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
+    s->rope_cos = calloc(p->dim / p->n_heads / 2 + 1, sizeof(float));
+    s->rope_sin = calloc(p->dim / p->n_heads / 2 + 1, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+     || !s->key_cache || !s->value_cache || !s->att || !s->logits
+     || !s->rope_cos || !s->rope_sin) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -109,6 +146,8 @@ void free_run_state(RunState* s) {
     free(s->q);
     free(s->att);
     free(s->logits);
+    free(s->rope_cos);
+    free(s->rope_sin);
     free(s->key_cache);
     free(s->value_cache);
 }
@@ -236,6 +275,7 @@ void softmax(float* x, int size) {
 #define POOL_SPIN_BEFORE_YIELD 200000
 #endif
 
+#if USE_AVX2
 static inline float hsum256(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -270,6 +310,11 @@ static void matmul_rows(float* xout, const float* x, const float* w, int n, int 
         }
         xout[i] = s0; xout[i+1] = s1; xout[i+2] = s2; xout[i+3] = s3;
     }
+#else
+// computes rows [r0, r1) of W (d,n) @ x (plain C, same order as the original)
+static void matmul_rows(float* xout, const float* x, const float* w, int n, int r0, int r1) {
+    int i = r0;
+#endif
     for (; i < r1; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -327,14 +372,16 @@ static int q8_init(const float* base, size_t n_floats, int dim, int hidden_dim) 
     q8_xs = malloc(maxn / Q8_GS * sizeof(float));
     if (!q8_w || !q8_ws || !q8_x || !q8_xs) return 0;
     size_t chunk = (size_t)Q8_GS * 4096;
+    int nchunks = (int)((n_floats + chunk - 1) / chunk);
     #pragma omp parallel for schedule(dynamic)
-    for (long long c = 0; c < (long long)((n_floats + chunk - 1) / chunk); c++) {
+    for (int c = 0; c < nchunks; c++) {
         size_t o = (size_t)c * chunk, len = n_floats - o < chunk ? n_floats - o : chunk;
         q8_quantize(q8_w + o, q8_ws + o / Q8_GS, base + o, len);
     }
     return 1;
 }
 
+#if USE_AVX2
 // sum of 32 int8 products a[i]*b[i], as 8 int32 lanes
 static inline __m256i q8_dot32(__m256i a, __m256i b) {
     __m256i ua = _mm256_sign_epi8(a, a);   // |a|, fits u8 since a >= -127
@@ -347,6 +394,7 @@ static inline __m256i q8_dot32(__m256i a, __m256i b) {
     return _mm256_madd_epi16(_mm256_maddubs_epi16(ua, sb), _mm256_set1_epi16(1));
 #endif
 }
+#endif
 
 // rows [r0, r1) of W (d,n) @ x, using the int8 copy of w and the quantized input q8_x
 static void matmul_rows_q8(float* xout, const float* w, int n, int r0, int r1) {
@@ -355,6 +403,7 @@ static void matmul_rows_q8(float* xout, const float* w, int n, int r0, int r1) {
     const float* wsc = q8_ws + off / Q8_GS;
     int ng = n / Q8_GS;
     int i = r0;
+#if USE_AVX2
     for (; i + 4 <= r1; i += 4) {
         __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
         __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
@@ -370,6 +419,7 @@ static void matmul_rows_q8(float* xout, const float* w, int n, int r0, int r1) {
         }
         xout[i] = hsum256(a0); xout[i+1] = hsum256(a1); xout[i+2] = hsum256(a2); xout[i+3] = hsum256(a3);
     }
+#endif
     for (; i < r1; i++) {
         float val = 0.0f;
         for (int g = 0; g < ng; g++) {
@@ -393,10 +443,12 @@ static inline void mm_rows(float* xout, const float* x, const float* w, int n, i
 
 // generic job: ntasks independent tasks, claimed dynamically by the caller and the workers
 typedef void (*pool_task_fn)(void* ctx, int task);
+static int pool_nthreads = 1;            // including the calling thread
+
+#if USE_POOL
 static pool_task_fn pool_fn;
 static void* pool_ctx;
 static int pool_ntasks;
-static int pool_nthreads = 1;            // including the calling thread
 static atomic_int pool_gen;              // bumped to publish a new job
 static atomic_int pool_next_task;        // work-stealing cursor
 static atomic_int pool_active;           // workers still running the current job
@@ -432,14 +484,27 @@ static void* pool_worker(void* arg) {
     for (;;) {
         int g, spins = 0;
         while ((g = atomic_load_explicit(&pool_gen, memory_order_acquire)) == seen) {
-            _mm_pause();
-            if (++spins >= POOL_SPIN_BEFORE_YIELD) { sched_yield(); spins = 0; }
+            CPU_RELAX();
+            if (++spins >= POOL_SPIN_BEFORE_YIELD) { POOL_YIELD(); spins = 0; }
         }
         seen = g;
         pool_run_job();
         atomic_fetch_sub_explicit(&pool_active, 1, memory_order_release);
     }
     return NULL;
+}
+#if defined _WIN32
+static DWORD WINAPI pool_worker_win(LPVOID arg) { pool_worker(arg); return 0; }
+#endif
+
+static int num_procs(void) {
+#if defined _OPENMP
+    return omp_get_num_procs();
+#elif defined _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1;
+#endif
 }
 
 static void pool_init(void) {
@@ -451,13 +516,23 @@ static void pool_init(void) {
     // (OS work preempts a spinner mid-job and everyone waits); on a Core Ultra 5 226V
     // (4P + 4LPE) 5 threads measured best: 4 -> ~530, 5 -> ~575, 7-8 -> fast but erratic tok/s.
     // OMP_NUM_THREADS overrides this.
-    int nt = getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : omp_get_num_procs() / 2 + 1;
+#ifdef _OPENMP
+    int nt = getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : num_procs() / 2 + 1;
+#else
+    int nt = getenv("OMP_NUM_THREADS") ? atoi(getenv("OMP_NUM_THREADS")) : num_procs() / 2 + 1;
+#endif
     if (nt < 1) nt = 1;
     pool_nthreads = nt;
     for (int t = 1; t < nt; t++) {
+#if defined _WIN32
+        HANDLE th = CreateThread(NULL, 0, pool_worker_win, NULL, 0, NULL);
+        if (!th) { pool_nthreads = t; break; }
+        CloseHandle(th);
+#else
         pthread_t th;
         if (pthread_create(&th, NULL, pool_worker, NULL) != 0) { pool_nthreads = t; break; }
         pthread_detach(th);
+#endif
     }
 }
 
@@ -472,8 +547,15 @@ static void pool_parallel_for(pool_task_fn fn, void* ctx, int ntasks) {
     atomic_store_explicit(&pool_active, pool_nthreads - 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&pool_gen, 1, memory_order_release); // publish
     pool_run_job();
-    while (atomic_load_explicit(&pool_active, memory_order_acquire) != 0) { _mm_pause(); }
+    while (atomic_load_explicit(&pool_active, memory_order_acquire) != 0) { CPU_RELAX(); }
 }
+#else
+// no atomics/threads available (e.g. MSVC): run everything on the calling thread
+static void pool_init(void) {}
+static void pool_parallel_for(pool_task_fn fn, void* ctx, int ntasks) {
+    for (int t = 0; t < ntasks; t++) fn(ctx, t);
+}
+#endif
 
 typedef struct { float* xout; const float* x; const float* w; int n; int d; } MatmulJob;
 
@@ -554,13 +636,16 @@ static void attention_head(void* ctx, int h) {
     for (int t = 0; t <= pos; t++) {
         // get the key vector for this head and at this timestep
         float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // calculate the attention score as the dot product of q and k (AVX2/FMA)
-        __m256 acc = _mm256_setzero_ps();
+        // calculate the attention score as the dot product of q and k
         int i = 0;
+        float score = 0.0f;
+#if USE_AVX2
+        __m256 acc = _mm256_setzero_ps();
         for (; i <= head_size - 8; i += 8) {
             acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), _mm256_loadu_ps(k + i), acc);
         }
-        float score = hsum256(acc);
+        score = hsum256(acc);
+#endif
         for (; i < head_size; i++) {
             score += q[i] * k[i];
         }
@@ -605,7 +690,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     memcpy(x, content_row, dim*sizeof(*x));
 
     // RoPE rotation factors depend only on (pos, head_dim): compute once per token, not per layer
-    float rope_cos[head_size / 2], rope_sin[head_size / 2];
+    float* rope_cos = s->rope_cos;
+    float* rope_sin = s->rope_sin;
     for (int hd = 0; hd < head_size; hd += 2) {
         float freq = 1.0f / powf(10000.0f, hd / (float)head_size);
         float val = pos * freq;
@@ -1104,7 +1190,11 @@ int sample(Sampler* sampler, float* logits) {
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
     struct timespec time;
+#if defined _WIN32
+    win_clock_gettime(CLOCK_REALTIME, &time);
+#else
     clock_gettime(CLOCK_REALTIME, &time);
+#endif
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 

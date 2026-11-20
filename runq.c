@@ -838,7 +838,11 @@ int sample(Sampler* sampler, float* logits) {
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
     struct timespec time;
+#if defined _WIN32
+    win_clock_gettime(CLOCK_REALTIME, &time);
+#else
     clock_gettime(CLOCK_REALTIME, &time);
+#endif
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 

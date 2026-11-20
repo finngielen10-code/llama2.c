@@ -60,7 +60,7 @@ int     mprotect(void *addr, size_t len, int prot);
 int     msync(void *addr, size_t len, int flags);
 int     mlock(const void *addr, size_t len);
 int     munlock(const void *addr, size_t len);
-int     clock_gettime(int clk_id, struct timespec *tp);
+int     win_clock_gettime(int clk_id, struct timespec *tp);
 
 #ifdef __cplusplus
 };
