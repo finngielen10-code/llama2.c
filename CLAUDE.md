@@ -23,10 +23,26 @@ gcc -O3 -fopenmp -march=native -fpermissive run.c win.c -lm -o run.exe
   - `scripts/ab.sh <old_run.c|git-rev> [N]` — interleaved A/B against a previous version (preferred for small gains).
 - Build/bench artifacts go in `build/` (gitignored).
 
-## Findings so far (stories15M)
-- Original: ~131 tok/s median (8 threads); 83 tok/s single-threaded → the scalar matmul was not vectorized.
-- AVX2/FMA matmul (4 rows × 8 lanes, `hsum256`) kept output identical.
-- OpenMP fork/join dominates for this tiny model: parallelize only matmuls with `d*n >= MATMUL_PAR_THRESHOLD` (1M, i.e. just the classifier) and keep attention serial (`ATTN_PAR_MIN_POS`). ~280 tok/s.
-- Precomputing RoPE cos/sin once per token (not per layer): small, exact win (~+3%).
-- Fewer threads (2 or 4) for the classifier was slower than the default 8.
-- Open idea: sampler `softmax` runs 32000 serial `expf` per token; a vectorized exp may change output bits.
+## Current design of `run.c`
+Result: ~131 → **~640 tok/s** median on stories15M (~4.9×), `-s 42` output byte-identical.
+
+- **Matmul kernel** (`matmul_rows`): AVX2/FMA, 4 rows × 8 lanes at a time, `hsum256` at the end. Each output row is computed the same way no matter which thread runs it, so results don't depend on thread count.
+- **Thread pool instead of OpenMP**: OpenMP fork/join on Windows costs tens of µs per parallel region (more than a whole small matmul). `pool_init` starts persistent worker threads that busy-wait (`_mm_pause`, then yield after `POOL_SPIN_BEFORE_YIELD` spins) on a generation counter. `pool_parallel_for(fn, ctx, ntasks)` publishes a job; threads grab tasks from an atomic cursor (work stealing). Sync costs ~1 µs.
+  - `POOL_MIN_WORK` (32768): matmuls with `d*n` below this run on the calling thread only.
+  - `POOL_CHUNK_ROWS` (64, multiple of 4): rows per stolen task.
+  - Thread count: `nprocs/2 + 1` (5 on the 226V). `OMP_NUM_THREADS` overrides. 4 → ~530, 5 → ~575, 7–8 → fast but erratic (OS work preempts a spinner and everyone waits).
+- **Fused jobs** (fewer syncs per layer): `matmul_multi` does Q, K, V as one pool job; `ffn_up_task` does W1 and W3 plus SwiGLU as one job.
+- **Attention**: one pool task per head (`attention_head`); the q·k dot product uses AVX2/FMA.
+- **RoPE**: cos/sin computed once per token (`rope_cos`/`rope_sin`), not once per layer.
+- **Sampler**:
+  - `softmax_parallel` splits the 32000-entry vocab softmax across the pool in `SOFTMAX_CHUNK` (2048) pieces: max, then exp, then divide. Each pass is a separate job.
+  - Temperature 1.0 skips the divide-by-temperature pass (dividing by 1.0f changes nothing).
+  - `sample_topp` first tries higher probability cutoffs, so it sorts only a few hundred tokens instead of thousands. It falls back to the original cutoff, so the result is the same.
+- **Windows only** (`set_high_qos`): turns off power throttling for the pool's threads so Windows 11 keeps them on P-cores. This gave ~624 → ~650 tok/s. It is compiled out on other platforms.
+
+## Findings
+- Original was ~131 tok/s with 8 threads but 83 tok/s single-threaded: the scalar matmul wasn't vectorized, and OpenMP overhead was large.
+- The classifier matmul (32000 × 288) is ~45% of the time and runs close to DRAM bandwidth (~74 GB/s). Further big gains need smaller weights (e.g. int8 quantization, see `runq.c`), which changes the output.
+- Tried and reverted (no measurable win): software prefetch, a 64-byte-aligned weight buffer, adaptive chunk sizes, 8 accumulators in the matmul.
+- SIMD sums add numbers in a different order than the original. Output for `-s 42` is identical, but other seeds/prompts could in theory pick a different token.
+- On Linux the throttling code is off and timings are not comparable with the Windows laptop numbers.
