@@ -61,3 +61,7 @@ Result: ~131 → **~640 tok/s** median on stories15M (~4.9×), `-s 42` output by
 - Tried and reverted (no measurable win): software prefetch, a 64-byte-aligned weight buffer, adaptive chunk sizes, 8 accumulators in the matmul.
 - SIMD sums add numbers in a different order than the original. Output for `-s 42` is identical, but other seeds/prompts could in theory pick a different token.
 - On Linux the throttling code is off and timings are not comparable with the Windows laptop numbers.
+- Windows laptop (2026-11-20, float path): ~680 tok/s median when cool, ~450-520 when hot/throttled, so always A/B.
+- Per-token profile (float path): classifier ~40%, FFN up ~15%, QKV ~12%, W2 ~10%, softmax+top-p ~8%, attention ~7%, Wo ~6%. ~60 MB of fp32 weights stream from DRAM per token.
+- Also rejected on the laptop (2026-11-20): software prefetch of the next 4-row block (-7% to -22% at distances 1/2/8); `POOL_CHUNK_ROWS` 16/32/128 (all slower than 64); 4 pool threads (clearly slower than 5); 6 threads (inconclusive: +8.6% in one 31-run A/B, tie in the next, so keep 5).
+- Vectorized exp: UCRT `expf` is not correctly rounded (~23k mismatches vs double exp). An AVX2 double-precision exp that falls back to scalar `expf` within 1/256 ulp of a rounding midpoint was verified bit-identical over all 2^32 inputs, but isn't worth it: `expf` is only ~2.8 ns/call (32000 calls = 91 us serial, ~18 us on the pool) and the unpredictable fallback branch made the vector version slower (114 us). Call `_mm256_zeroupper()` before calling libm from AVX code.
