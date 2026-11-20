@@ -7,6 +7,11 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <immintrin.h>
+#include <omp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -214,17 +219,257 @@ void softmax(float* x, int size) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// matmul: AVX2/FMA kernel + a tiny persistent spin-wait thread pool.
+// libgomp's fork/join on Windows costs tens of microseconds per parallel region,
+// which is more than a whole small matmul; a spinning pool syncs in ~1us.
+// Each output row is computed exactly as in the serial kernel, so results are
+// bit-identical regardless of how rows are distributed across threads.
+
+#ifndef POOL_MIN_WORK
+#define POOL_MIN_WORK 32768   // d*n below this runs on the calling thread only
+#endif
+#ifndef POOL_CHUNK_ROWS
+#define POOL_CHUNK_ROWS 64    // rows grabbed per work-steal step (multiple of 4)
+#endif
+#ifndef POOL_SPIN_BEFORE_YIELD
+#define POOL_SPIN_BEFORE_YIELD 200000
+#endif
+
+static inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+    return _mm_cvtss_f32(lo);
+}
+
+// computes rows [r0, r1) of W (d,n) @ x; r0 must be a multiple of 4
+static void matmul_rows(float* xout, const float* x, const float* w, int n, int r0, int r1) {
+    int i = r0;
+    for (; i + 4 <= r1; i += 4) {
+        const float* w0 = w + (size_t)i * n;
+        const float* w1 = w0 + n;
+        const float* w2 = w1 + n;
+        const float* w3 = w2 + n;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            __m256 xv = _mm256_loadu_ps(x + j);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + j), xv, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + j), xv, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + j), xv, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + j), xv, a3);
+        }
+        float s0 = hsum256(a0), s1 = hsum256(a1), s2 = hsum256(a2), s3 = hsum256(a3);
+        for (; j < n; j++) {
+            s0 += w0[j] * x[j]; s1 += w1[j] * x[j];
+            s2 += w2[j] * x[j]; s3 += w3[j] * x[j];
+        }
+        xout[i] = s0; xout[i+1] = s1; xout[i+2] = s2; xout[i+3] = s3;
+    }
+    for (; i < r1; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[(size_t)i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+}
+
+// generic job: ntasks independent tasks, claimed dynamically by the caller and the workers
+typedef void (*pool_task_fn)(void* ctx, int task);
+static pool_task_fn pool_fn;
+static void* pool_ctx;
+static int pool_ntasks;
+static int pool_nthreads = 1;            // including the calling thread
+static atomic_int pool_gen;              // bumped to publish a new job
+static atomic_int pool_next_task;        // work-stealing cursor
+static atomic_int pool_active;           // workers still running the current job
+
+static void pool_run_job(void) {
+    for (;;) {
+        int t = atomic_fetch_add_explicit(&pool_next_task, 1, memory_order_relaxed);
+        if (t >= pool_ntasks) break;
+        pool_fn(pool_ctx, t);
+    }
+}
+
+// Windows 11 on hybrid CPUs: opt the calling thread out of power throttling (EcoQoS) so
+// Thread Director prefers performance cores for it. No-op elsewhere.
+static void set_high_qos(void) {
+#if defined _WIN32 && defined THREAD_POWER_THROTTLING_CURRENT_VERSION
+    THREAD_POWER_THROTTLING_STATE st;
+    memset(&st, 0, sizeof(st));
+    st.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    st.StateMask = 0; // throttling off
+    // resolved at runtime: the API is Windows 8+ and not declared under win.h's _WIN32_WINNT
+    typedef BOOL (WINAPI *SetThreadInformationFn)(HANDLE, int, LPVOID, DWORD);
+    SetThreadInformationFn fn = (SetThreadInformationFn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadInformation");
+    if (fn) fn(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof(st));
+#endif
+}
+
+static void* pool_worker(void* arg) {
+    (void)arg;
+    set_high_qos();
+    int seen = atomic_load_explicit(&pool_gen, memory_order_acquire);
+    for (;;) {
+        int g, spins = 0;
+        while ((g = atomic_load_explicit(&pool_gen, memory_order_acquire)) == seen) {
+            _mm_pause();
+            if (++spins >= POOL_SPIN_BEFORE_YIELD) { sched_yield(); spins = 0; }
+        }
+        seen = g;
+        pool_run_job();
+        atomic_fetch_sub_explicit(&pool_active, 1, memory_order_release);
+    }
+    return NULL;
+}
+
+static void pool_init(void) {
+    static int initialized = 0;
+    if (initialized) return;
+    initialized = 1;
+    set_high_qos();
+    // Default to half the logical CPUs + 1. Spinning on every logical CPU oversubscribes
+    // (OS work preempts a spinner mid-job and everyone waits); on a Core Ultra 5 226V
+    // (4P + 4LPE) 5 threads measured best: 4 -> ~530, 5 -> ~575, 7-8 -> fast but erratic tok/s.
+    // OMP_NUM_THREADS overrides this.
+    int nt = getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : omp_get_num_procs() / 2 + 1;
+    if (nt < 1) nt = 1;
+    pool_nthreads = nt;
+    for (int t = 1; t < nt; t++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, pool_worker, NULL) != 0) { pool_nthreads = t; break; }
+        pthread_detach(th);
+    }
+}
+
+// runs fn(ctx, 0..ntasks-1) across the pool; returns when all tasks are done
+static void pool_parallel_for(pool_task_fn fn, void* ctx, int ntasks) {
+    if (pool_nthreads <= 1 || ntasks <= 1) {
+        for (int t = 0; t < ntasks; t++) fn(ctx, t);
+        return;
+    }
+    pool_fn = fn; pool_ctx = ctx; pool_ntasks = ntasks;
+    atomic_store_explicit(&pool_next_task, 0, memory_order_relaxed);
+    atomic_store_explicit(&pool_active, pool_nthreads - 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&pool_gen, 1, memory_order_release); // publish
+    pool_run_job();
+    while (atomic_load_explicit(&pool_active, memory_order_acquire) != 0) { _mm_pause(); }
+}
+
+typedef struct { float* xout; const float* x; const float* w; int n; int d; } MatmulJob;
+
+static void matmul_task(void* ctx, int task) {
+    const MatmulJob* j = (const MatmulJob*)ctx;
+    int r0 = task * POOL_CHUNK_ROWS;
+    int r1 = r0 + POOL_CHUNK_ROWS < j->d ? r0 + POOL_CHUNK_ROWS : j->d;
+    matmul_rows(j->xout, j->x, j->w, j->n, r0, r1);
+}
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+    if (pool_nthreads <= 1 || (size_t)d * n < POOL_MIN_WORK) {
+        matmul_rows(xout, x, w, n, 0, d);
+        return;
+    }
+    MatmulJob job = { xout, x, w, n, d };
+    pool_parallel_for(matmul_task, &job, (d + POOL_CHUNK_ROWS - 1) / POOL_CHUNK_ROWS);
+}
+
+// several matmuls sharing the same input x, dispatched as ONE pool job (one sync instead of n)
+typedef struct { const float* x; int n; int nmat; float* out[3]; const float* w[3]; int d[3]; int first_task[4]; } MultiMatmulJob;
+
+static void multi_matmul_task(void* ctx, int task) {
+    const MultiMatmulJob* j = (const MultiMatmulJob*)ctx;
+    int m = 0;
+    while (task >= j->first_task[m + 1]) m++;
+    int r0 = (task - j->first_task[m]) * POOL_CHUNK_ROWS;
+    int r1 = r0 + POOL_CHUNK_ROWS < j->d[m] ? r0 + POOL_CHUNK_ROWS : j->d[m];
+    matmul_rows(j->out[m], j->x, j->w[m], j->n, r0, r1);
+}
+
+// xout_k = W_k (d_k,n) @ x for k < nmat (nmat <= 3)
+static void matmul_multi(int nmat, const float* x, int n, float** outs, float** ws, const int* ds) {
+    MultiMatmulJob j; j.x = x; j.n = n; j.nmat = nmat; j.first_task[0] = 0;
+    for (int m = 0; m < nmat; m++) {
+        j.out[m] = outs[m]; j.w[m] = ws[m]; j.d[m] = ds[m];
+        j.first_task[m + 1] = j.first_task[m] + (ds[m] + POOL_CHUNK_ROWS - 1) / POOL_CHUNK_ROWS;
+    }
+    pool_parallel_for(multi_matmul_task, &j, j.first_task[nmat]);
+}
+
+// FFN up-projection fused with SwiGLU: hb = silu(W1 x) * (W3 x), rows split across the pool
+typedef struct { float* hb; float* hb2; const float* x; const float* w1; const float* w3; int n; int d; } FfnUpJob;
+
+static void ffn_up_task(void* ctx, int task) {
+    const FfnUpJob* j = (const FfnUpJob*)ctx;
+    int r0 = task * POOL_CHUNK_ROWS;
+    int r1 = r0 + POOL_CHUNK_ROWS < j->d ? r0 + POOL_CHUNK_ROWS : j->d;
+    matmul_rows(j->hb, j->x, j->w1, j->n, r0, r1);
+    matmul_rows(j->hb2, j->x, j->w3, j->n, r0, r1);
+    // SwiGLU non-linearity
+    for (int i = r0; i < r1; i++) {
+        float val = j->hb[i];
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        val *= (1.0f / (1.0f + expf(-val)));
+        // elementwise multiply with w3(x)
+        val *= j->hb2[i];
+        j->hb[i] = val;
+    }
+}
+
+// one attention head: scores, softmax, weighted sum of values (same math as the original loop)
+typedef struct { RunState* s; int pos, head_size, kv_dim, kv_mul, seq_len, loff; } AttnJob;
+
+static void attention_head(void* ctx, int h) {
+    const AttnJob* j = (const AttnJob*)ctx;
+    RunState* s = j->s;
+    int pos = j->pos, head_size = j->head_size, kv_dim = j->kv_dim, kv_mul = j->kv_mul, loff = j->loff;
+    // get the query vector for this head
+    float* q = s->q + h * head_size;
+    // attention scores for this head
+    float* att = s->att + h * j->seq_len;
+    // iterate over all timesteps, including the current one
+    for (int t = 0; t <= pos; t++) {
+        // get the key vector for this head and at this timestep
+        float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        // calculate the attention score as the dot product of q and k (AVX2/FMA)
+        __m256 acc = _mm256_setzero_ps();
+        int i = 0;
+        for (; i <= head_size - 8; i += 8) {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), _mm256_loadu_ps(k + i), acc);
         }
-        xout[i] = val;
+        float score = hsum256(acc);
+        for (; i < head_size; i++) {
+            score += q[i] * k[i];
+        }
+        score /= sqrtf(head_size);
+        // save the score to the attention buffer
+        att[t] = score;
+    }
+
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
+
+    // weighted sum of the values, store back into xb
+    float* xb = s->xb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+        // get the value vector for this head and at this timestep
+        float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        // get the attention weight for this timestep
+        float a = att[t];
+        // accumulate the weighted value into xb
+        for (int i = 0; i < head_size; i++) {
+            xb[i] += a * v[i];
+        }
     }
 }
 
@@ -245,6 +490,15 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
+    // RoPE rotation factors depend only on (pos, head_dim): compute once per token, not per layer
+    float rope_cos[head_size / 2], rope_sin[head_size / 2];
+    for (int hd = 0; hd < head_size; hd += 2) {
+        float freq = 1.0f / powf(10000.0f, hd / (float)head_size);
+        float val = pos * freq;
+        rope_cos[hd >> 1] = cosf(val);
+        rope_sin[hd >> 1] = sinf(val);
+    }
+
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
@@ -257,17 +511,18 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        {
+            float* outs[3] = { s->q, s->k, s->v };
+            float* ws[3] = { w->wq + l*dim*dim, w->wk + l*dim*kv_dim, w->wv + l*dim*kv_dim };
+            int ds[3] = { dim, kv_dim, kv_dim };
+            matmul_multi(3, s->xb, dim, outs, ws, ds);
+        }
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = rope_cos[head_dim >> 1];
+            float fci = rope_sin[head_dim >> 1];
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
             for (int v = 0; v < rotn; v++) {
                 float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
@@ -278,45 +533,9 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        // multihead attention. iterate over all heads
-        int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
-            }
-        }
+        // multihead attention: one pool task per head
+        AttnJob attn = { s, pos, head_size, kv_dim, kv_mul, p->seq_len, loff };
+        pool_parallel_for(attention_head, &attn, p->n_heads);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
@@ -331,18 +550,9 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-
-        // SwiGLU non-linearity
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
-            // elementwise multiply with w3(x)
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
+        // fused with the SwiGLU non-linearity, as one pool job
+        FfnUpJob ffn = { s->hb, s->hb2, s->xb, w->w1 + l*dim*hidden_dim, w->w3 + l*dim*hidden_dim, dim, hidden_dim };
+        pool_parallel_for(ffn_up_task, &ffn, (hidden_dim + POOL_CHUNK_ROWS - 1) / POOL_CHUNK_ROWS);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
@@ -587,6 +797,49 @@ typedef struct {
     unsigned long long rng_state;
 } Sampler;
 
+// softmax over the (large) vocab, split across the thread pool.
+// max and the per-element exp/divide are order-independent; only the sum is
+// accumulated per chunk and then combined in fixed chunk order (deterministic).
+#ifndef SOFTMAX_CHUNK
+#define SOFTMAX_CHUNK 2048
+#endif
+typedef struct { float* x; int n; float max_val; float sum; float partial[64]; } SoftmaxJob;
+
+static void softmax_max_task(void* ctx, int t) {
+    SoftmaxJob* j = (SoftmaxJob*)ctx;
+    int i0 = t * SOFTMAX_CHUNK, i1 = i0 + SOFTMAX_CHUNK < j->n ? i0 + SOFTMAX_CHUNK : j->n;
+    float m = j->x[i0];
+    for (int i = i0 + 1; i < i1; i++) { if (j->x[i] > m) m = j->x[i]; }
+    j->partial[t] = m;
+}
+static void softmax_exp_task(void* ctx, int t) {
+    SoftmaxJob* j = (SoftmaxJob*)ctx;
+    int i0 = t * SOFTMAX_CHUNK, i1 = i0 + SOFTMAX_CHUNK < j->n ? i0 + SOFTMAX_CHUNK : j->n;
+    float sum = 0.0f;
+    for (int i = i0; i < i1; i++) { j->x[i] = expf(j->x[i] - j->max_val); sum += j->x[i]; }
+    j->partial[t] = sum;
+}
+static void softmax_div_task(void* ctx, int t) {
+    SoftmaxJob* j = (SoftmaxJob*)ctx;
+    int i0 = t * SOFTMAX_CHUNK, i1 = i0 + SOFTMAX_CHUNK < j->n ? i0 + SOFTMAX_CHUNK : j->n;
+    for (int i = i0; i < i1; i++) { j->x[i] /= j->sum; }
+}
+
+void softmax_parallel(float* x, int n) {
+    int nt = (n + SOFTMAX_CHUNK - 1) / SOFTMAX_CHUNK;
+    if (nt > 64 || pool_nthreads <= 1) { softmax(x, n); return; }
+    SoftmaxJob j; j.x = x; j.n = n;
+    pool_parallel_for(softmax_max_task, &j, nt);
+    float m = j.partial[0];
+    for (int t = 1; t < nt; t++) { if (j.partial[t] > m) m = j.partial[t]; }
+    j.max_val = m;
+    pool_parallel_for(softmax_exp_task, &j, nt);
+    float sum = 0.0f;
+    for (int t = 0; t < nt; t++) { sum += j.partial[t]; }
+    j.sum = sum;
+    pool_parallel_for(softmax_div_task, &j, nt);
+}
+
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
     int max_i = 0;
@@ -632,12 +885,26 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
     const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
-            n0++;
+    // Speedup: the truncated list is a prefix of the descending sort, i.e. it only contains
+    // the largest probabilities. So first gather just the tokens above a much higher
+    // threshold; if those already sum past topp (with a margin for summation-order rounding),
+    // the prefix lies entirely inside that small set and we only need to sort it.
+    // Otherwise lower the threshold, ending at the original cutoff.
+    static const float thresholds[] = { 1e-2f, 1e-3f, 1e-4f };
+    for (int t = 0; t <= 3; t++) {
+        float th = t < 3 ? thresholds[t] : cutoff;
+        if (th < cutoff) th = cutoff;
+        n0 = 0;
+        float mass = 0.0f;
+        for (int i = 0; i < n; i++) {
+            if (probabilities[i] >= th) {
+                probindex[n0].index = i;
+                probindex[n0].prob = probabilities[i];
+                mass += probabilities[i];
+                n0++;
+            }
         }
+        if (th == cutoff || mass > topp + 1e-3f) break;
     }
     qsort(probindex, n0, sizeof(ProbIndex), compare);
 
@@ -696,9 +963,12 @@ int sample(Sampler* sampler, float* logits) {
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        // (dividing by exactly 1.0f is the identity, so skip the pass in that common case)
+        if (sampler->temperature != 1.0f) {
+            for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        }
         // apply softmax to the logits to get the probabilities for next token
-        softmax(logits, sampler->vocab_size);
+        softmax_parallel(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
         // we sample from this distribution to get the next token
@@ -944,6 +1214,7 @@ int main(int argc, char *argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    pool_init();
     if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // override to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
