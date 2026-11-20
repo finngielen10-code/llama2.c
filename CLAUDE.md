@@ -52,7 +52,8 @@ Result: ~131 → **~640 tok/s** median on stories15M (~4.9×), `-s 42` output by
 - At load, all weights are quantized "Q8_0" style: groups of 32 (`Q8_GS`, must be 32) as int8 in [-127,127] plus a float scale. The int8 copy mirrors the float region element by element, so `matmul_rows_q8` finds a matrix's int8 copy by its float pointer's offset.
 - Each matmul input is quantized once (`mm_prep`) before its pool job; `mm_rows` picks the float or int8 kernel. The dot product uses AVX-VNNI `dpbusd` when available, else `maddubs`+`madd`.
 - Only matmuls change; attention, norms and the embedding lookup stay float.
-- Linux Xeon, random weights shaped like stories15M: ~920 → ~1700 tok/s (~1.8×). Logits differ from float by ~2% (relative L2), and the top token matched in the tested positions. Output text differs from the float run, so it can't be checked against `tests/ref_s42.txt`.
+- Real stories15M on a Linux cloud Xeon (4 cores), `-s 42`, 11 interleaved runs: ~910 → ~1900 tok/s median (~2.1×).
+- Quality: when both modes are fed the same 256-token story, 8-bit picks the same top next token 98.8% of the time (252/255). Average log-prob of the story is -0.367 vs -0.364 for float. Stories read just as well, but they branch off from the float story after a few dozen tokens, so the output can't be checked against `tests/ref_s42.txt`.
 
 ## Findings
 - Original was ~131 tok/s with 8 threads but 83 tok/s single-threaded: the scalar matmul wasn't vectorized, and OpenMP overhead was large.
