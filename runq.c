@@ -642,6 +642,8 @@ static int g_print_high_bytes = 0;
 
 #if defined _WIN32
 static UINT g_saved_console_cp = 0; // console output code page to restore at exit
+// (also runs when Ctrl-C ends the program: checked in a real console, the UCRT runs atexit
+// handlers on Ctrl-C, so the code page goes back to e.g. 437)
 static void restore_console_cp(void) { fflush(stdout); SetConsoleOutputCP(g_saved_console_cp); }
 #endif
 
@@ -674,7 +676,8 @@ static void build_bpe_tokenizer(Tokenizer* t, FILE* file, int vocab_size) {
     t->eos_id = hdr[3];
     t->n_merges = hdr[4];
     t->max_token_length = (unsigned int)hdr[5];
-    if (t->bos_id < 0 || t->bos_id >= vocab_size || t->eos_id < 0 || t->eos_id >= vocab_size || t->n_merges < 0) {
+    if (t->bos_id < 0 || t->bos_id >= vocab_size || t->eos_id < 0 || t->eos_id >= vocab_size || t->n_merges < 0
+        || hdr[5] < 1 || hdr[5] > (1 << 16)) { // max token length: real tokenizers are < 1 KB; bounds malloc(len + 1)
         fprintf(stderr, "bad BPE2 tokenizer header\n"); exit(EXIT_FAILURE);
     }
     t->vocab = (char**)malloc(vocab_size * sizeof(char*));
@@ -1388,7 +1391,11 @@ static void append_encoded(Tokenizer *tokenizer, char *text, int *tokens, int *n
 //                 "zephyr" = <|system|>/<|user|>/<|assistant|> turns ended by </s> (TinyLlama-Chat v1.0)
 //                 "chatml" = <|im_start|>role\n...<|im_end|> turns (SmolLM2, needs its BPE2 tokenizer)
 // With no -c, a byte-level BPE tokenizer uses chatml and the original tokenizer uses llama2.
-#define CHATML_DEFAULT_SYSTEM "You are a helpful AI assistant named SmolLM, trained by Hugging Face" // SmolLM2's template default
+// System prompt used by -c chatml when -y is not given. This is SmolLM2's chat-template
+// default; for another ChatML model pass -y, or build with -DCHATML_DEFAULT_SYSTEM="\"...\"".
+#ifndef CHATML_DEFAULT_SYSTEM
+#define CHATML_DEFAULT_SYSTEM "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+#endif
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps, char *chat_template) {
     if (chat_template == NULL) chat_template = tokenizer->bpe ? "chatml" : "llama2";
@@ -1557,7 +1564,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
-    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode (chatml without -y uses SmolLM2's default)\n");
     fprintf(stderr, "  -c <string> chat template: llama2|zephyr|chatml, default: chatml with a BPE2 tokenizer\n");
     fprintf(stderr, "              (SmolLM2), else llama2. Use zephyr for TinyLlama-Chat.\n");
     exit(EXIT_FAILURE);

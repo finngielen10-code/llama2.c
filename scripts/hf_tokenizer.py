@@ -22,6 +22,7 @@ Usage:
     python scripts/hf_tokenizer.py hf/SmolLM2-1.7B-Instruct/tokenizer.json smollm2_tokenizer.bin
 """
 import json
+import os
 import struct
 import sys
 
@@ -94,10 +95,31 @@ def main():
             sys.exit(f"merge {a!r} + {b!r} refers to a missing token")
         merges.append((vocab[a], vocab[b], vocab[a + b]))
 
-    # BOS/EOS for runq.c's generate mode: <|endoftext|> separates documents; <|im_end|> ends
-    # an assistant turn (chat mode looks up <|im_start|>/<|im_end|> by name itself)
-    bos = vocab.get("<|endoftext|>", 0)
-    eos = vocab.get("<|im_end|>", bos)
+    # BOS/EOS for runq.c's generate mode: <|endoftext|> separates documents and <|im_end|>
+    # ends an assistant turn (chat mode looks up <|im_start|>/<|im_end|> by name itself).
+    # Otherwise use the tokenizer_config.json next to tokenizer.json; never guess an id.
+    config = {}
+    config_path = os.path.join(os.path.dirname(os.path.abspath(src)), "tokenizer_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+
+    def token_name(v):
+        return v.get("content") if isinstance(v, dict) else v
+
+    def pick(*names):
+        for name in names:
+            if name is not None and name in vocab:
+                return vocab[name]
+        return None
+
+    bos = pick("<|endoftext|>", token_name(config.get("bos_token")))
+    if bos is None:
+        sys.exit("no <|endoftext|> token and no bos_token in tokenizer_config.json; "
+                 "can't choose a BOS token for runq.c's generate mode")
+    eos = pick("<|im_end|>", token_name(config.get("eos_token")))
+    if eos is None:
+        eos = bos
 
     with open(out_path, "wb") as f:
         f.write(struct.pack("<iiiiiii", 0x32455042, 1, n, bos, eos, len(merges), max(len(p) for p in pieces)))
