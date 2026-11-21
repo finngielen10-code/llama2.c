@@ -640,6 +640,11 @@ typedef struct {
 // bytes >= 0x80 must be printed, not filtered out as the SentencePiece path does
 static int g_print_high_bytes = 0;
 
+#if defined _WIN32
+static UINT g_saved_console_cp = 0; // console output code page to restore at exit
+static void restore_console_cp(void) { fflush(stdout); SetConsoleOutputCP(g_saved_console_cp); }
+#endif
+
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
@@ -1614,8 +1619,12 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 #if defined _WIN32
-    // byte-level BPE output is raw UTF-8; make the Windows console display it as such
-    if (tokenizer.bpe) SetConsoleOutputCP(65001);
+    // byte-level BPE output is raw UTF-8; make the Windows console display it as such. The
+    // code page belongs to the console (it outlives this process), so restore it at exit.
+    if (tokenizer.bpe) {
+        g_saved_console_cp = GetConsoleOutputCP();
+        if (g_saved_console_cp && g_saved_console_cp != 65001 && SetConsoleOutputCP(65001)) atexit(restore_console_cp);
+    }
 #endif
 
     // build the Sampler
