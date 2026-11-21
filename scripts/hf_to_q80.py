@@ -32,12 +32,25 @@ class SafeTensors:
         if not files:
             sys.exit(f"no .safetensors files in {model_dir}")
         for f in files:
+            size = os.path.getsize(f)
             with open(f, "rb") as fh:
                 n = struct.unpack("<Q", fh.read(8))[0]
+                if n > size - 8:
+                    sys.exit(f"{f}: header length {n} is past the end of the file (truncated download?)")
                 header = json.loads(fh.read(n))
             for name, meta in header.items():
                 if name == "__metadata__":
                     continue
+                # the byte range must match shape x dtype and lie inside the file, so a truncated
+                # or corrupt file fails here with a clear message instead of deep inside numpy
+                dt = meta.get("dtype")
+                if dt in self.DTYPES:
+                    start, end = meta["data_offsets"]
+                    want = int(np.prod(meta["shape"], dtype=np.int64)) * np.dtype(self.DTYPES[dt]).itemsize
+                    if not (0 <= start <= end) or end - start != want:
+                        sys.exit(f"{f}: tensor {name} has a byte range that doesn't match its shape and dtype")
+                    if 8 + n + end > size:
+                        sys.exit(f"{f}: tensor {name} extends past the end of the file (truncated download?)")
                 self.index[name] = (f, 8 + n, meta)
 
     def get(self, name):
@@ -110,7 +123,10 @@ def main():
     for name in st.index:
         if name.endswith(".bias"):
             sys.exit(f"cannot convert for runq.c: checkpoint has bias tensor {name}")
-    shared = "lm_head.weight" not in st.index or cfg.get("tie_word_embeddings", False)
+    shared = bool(cfg.get("tie_word_embeddings", False))
+    if not shared and "lm_head.weight" not in st.index:
+        sys.exit("config.json has tie_word_embeddings=false but there is no lm_head.weight "
+                 "(missing shard?); refusing to use the embeddings as the classifier")
 
     gs = 64
     while dim % gs != 0 or hidden_dim % gs != 0:
