@@ -1217,7 +1217,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
             fflush(stdout);
         }
-        if (next == 2) { printf("\n"); }
+        // end of the reply (not an EOS prediction made while the prompt is still being fed in)
+        if (user_idx >= num_prompt_tokens && next == 2) { printf("\n"); }
     }
     printf("\n");
     free(prompt_tokens);

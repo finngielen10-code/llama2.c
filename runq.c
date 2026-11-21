@@ -1529,7 +1529,9 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
             fflush(stdout);
         }
-        if (next == eos) { printf("\n"); }
+        // end of the reply (not a prediction made while the prompt is still being fed in,
+        // which used to print stray blank lines before the answer)
+        if (user_idx >= num_prompt_tokens && next == eos) { printf("\n"); }
     }
     printf("\n");
     if (pos >= steps) {
