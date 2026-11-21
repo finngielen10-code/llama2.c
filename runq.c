@@ -98,6 +98,7 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
+    float rope_theta; // RoPE base frequency: 10000 for version 2 files, from the header for version 3
 } Transformer;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -233,18 +234,18 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
+                     int* fd, float** data, ssize_t* file_size, float* rope_theta) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
     // read in magic number (uint32), has to be 0x616b3432, i.e. "ak42" in ASCII
     uint32_t magic_number;
     if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
     if (magic_number != 0x616b3432) { fprintf(stderr, "Bad magic number\n"); exit(EXIT_FAILURE); }
-    // read in the version number (uint32), has to be 2
+    // read in the version number (uint32): 2, or 3 = version 2 plus a rope_theta field
     int version;
     if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 2) { fprintf(stderr, "Bad version %d, need version 2\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 2 in bytes
+    if (version != 2 && version != 3) { fprintf(stderr, "Bad version %d, need version 2 or 3\n", version); exit(EXIT_FAILURE); }
+    int header_size = 256; // the header size for versions 2 and 3 in bytes
     // read in the Config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
     // read in flags
@@ -253,6 +254,16 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     int group_size; // the group size used in quantization
     if (fread(&group_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
     GS = group_size; // set as global, as it will be used in many places
+    if (GS <= 0) { fprintf(stderr, "bad group size %d\n", GS); exit(EXIT_FAILURE); }
+    // RoPE base: version 3 files (scripts/hf_to_q80.py, rope_theta != 10000) store it in the
+    // header padding right after the group size; version 2 means the Llama 2 default 10000.
+    float theta = 10000.0f;
+    if (version == 3) {
+        if (fread(&theta, sizeof(float), 1, file) != 1 || !(theta > 0.0f)) {
+            fprintf(stderr, "bad rope_theta in header\n"); exit(EXIT_FAILURE);
+        }
+    }
+    *rope_theta = theta;
     // figure out the file size
     // get the file size in bytes; 64-bit on Windows, where ftell's long is 32 bits and
     // would break checkpoints of 2 GB or more
@@ -275,7 +286,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size, &t->rope_theta);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
@@ -504,7 +515,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     // but evaluated once per token instead of once per layer (identical values)
     for (int i = 0; i < dim; i+=2) {
         int head_dim = i % head_size;
-        float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+        float freq = 1.0f / powf(transformer->rope_theta, head_dim / (float)head_size);
         float val = pos * freq;
         s->rope_cos[i / 2] = cosf(val);
         s->rope_sin[i / 2] = sinf(val);
@@ -609,13 +620,116 @@ typedef struct {
     int vocab_size;
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
+    // ids used by generate/chat: 1/2 for the original llama2.c tokenizer.bin
+    int bos_id, eos_id;
+    // byte-level BPE ("BPE2" files from scripts/hf_tokenizer.py, e.g. SmolLM2); bpe == 0
+    // means the original SentencePiece-style tokenizer.bin and none of these are used
+    int bpe;
+    int* vocab_len;              // byte length of each piece (pieces may contain any byte)
+    unsigned char* is_special;   // special tokens: inserted by id, decode to nothing
+    int byte_token[256];         // base token of each byte, -1 = none (byte is dropped)
+    int n_merges;
+    uint64_t* merge_keys;        // (left << 32 | right), sorted, for binary search
+    int* merge_rank;             // aligned with merge_keys: rank (lower merges first)
+    int* merge_result;           // aligned with merge_keys: merged token id
 } Tokenizer;
+
+#define BPE2_MAGIC 0x32455042 // "BPE2"
+
+// printing: byte-level BPE splits multi-byte UTF-8 characters across tokens, so single
+// bytes >= 0x80 must be printed, not filtered out as the SentencePiece path does
+static int g_print_high_bytes = 0;
 
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
+static void read_or_die(void* dst, size_t size, size_t n, FILE* f) {
+    if (fread(dst, size, n, f) != n) { fprintf(stderr, "failed read (truncated tokenizer file?)\n"); exit(EXIT_FAILURE); }
+}
+
+typedef struct { uint64_t key; int rank, result; } MergeEntry;
+static int compare_merges(const void* a, const void* b) {
+    uint64_t x = ((const MergeEntry*)a)->key, y = ((const MergeEntry*)b)->key;
+    return (x > y) - (x < y);
+}
+
+// byte-level BPE tokenizer file (see scripts/hf_tokenizer.py for the layout)
+static void build_bpe_tokenizer(Tokenizer* t, FILE* file, int vocab_size) {
+    int hdr[6]; // version, vocab_size, bos, eos, n_merges, max_token_length
+    read_or_die(hdr, sizeof(int), 6, file);
+    if (hdr[0] != 1) { fprintf(stderr, "unsupported BPE2 tokenizer version %d\n", hdr[0]); exit(EXIT_FAILURE); }
+    if (hdr[1] != vocab_size) {
+        fprintf(stderr, "tokenizer has %d tokens but the model has %d (wrong -z file?)\n", hdr[1], vocab_size);
+        exit(EXIT_FAILURE);
+    }
+    t->bpe = 1;
+    t->vocab_size = vocab_size;
+    t->bos_id = hdr[2];
+    t->eos_id = hdr[3];
+    t->n_merges = hdr[4];
+    t->max_token_length = (unsigned int)hdr[5];
+    if (t->bos_id < 0 || t->bos_id >= vocab_size || t->eos_id < 0 || t->eos_id >= vocab_size || t->n_merges < 0) {
+        fprintf(stderr, "bad BPE2 tokenizer header\n"); exit(EXIT_FAILURE);
+    }
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+    t->vocab_len = (int*)malloc(vocab_size * sizeof(int));
+    t->is_special = (unsigned char*)malloc(vocab_size);
+    t->vocab_scores = NULL;
+    t->sorted_vocab = NULL;
+    for (int b = 0; b < 256; b++) t->byte_token[b] = -1;
+    for (int i = 0; i < vocab_size; i++) {
+        unsigned char flags; int len;
+        read_or_die(&flags, 1, 1, file);
+        read_or_die(&len, sizeof(int), 1, file);
+        if (len < 0 || len > (int)t->max_token_length) { fprintf(stderr, "bad token length\n"); exit(EXIT_FAILURE); }
+        t->vocab[i] = (char*)malloc(len + 1);
+        if (len) read_or_die(t->vocab[i], 1, len, file);
+        t->vocab[i][len] = '\0';
+        t->vocab_len[i] = len;
+        t->is_special[i] = flags & 1;
+        if (len == 1 && !t->is_special[i]) t->byte_token[(unsigned char)t->vocab[i][0]] = i;
+    }
+    MergeEntry* m = (MergeEntry*)malloc((t->n_merges ? t->n_merges : 1) * sizeof(MergeEntry));
+    for (int r = 0; r < t->n_merges; r++) {
+        int e[3];
+        read_or_die(e, sizeof(int), 3, file);
+        for (int k = 0; k < 3; k++) {
+            if (e[k] < 0 || e[k] >= vocab_size) { fprintf(stderr, "bad merge entry\n"); exit(EXIT_FAILURE); }
+        }
+        m[r].key = ((uint64_t)(uint32_t)e[0] << 32) | (uint32_t)e[1];
+        m[r].rank = r;
+        m[r].result = e[2];
+    }
+    qsort(m, t->n_merges, sizeof(MergeEntry), compare_merges);
+    t->merge_keys = (uint64_t*)malloc((t->n_merges ? t->n_merges : 1) * sizeof(uint64_t));
+    t->merge_rank = (int*)malloc((t->n_merges ? t->n_merges : 1) * sizeof(int));
+    t->merge_result = (int*)malloc((t->n_merges ? t->n_merges : 1) * sizeof(int));
+    for (int r = 0; r < t->n_merges; r++) {
+        t->merge_keys[r] = m[r].key; t->merge_rank[r] = m[r].rank; t->merge_result[r] = m[r].result;
+    }
+    free(m);
+    g_print_high_bytes = 1;
+}
+
 void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+    t->bpe = 0;
+    t->bos_id = 1;
+    t->eos_id = 2;
+    t->vocab_len = NULL; t->is_special = NULL;
+    t->merge_keys = NULL; t->merge_rank = NULL; t->merge_result = NULL; t->n_merges = 0;
+    {
+        FILE *file = fopen(tokenizer_path, "rb");
+        if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+        int magic = 0;
+        if (fread(&magic, sizeof(int), 1, file) == 1 && magic == BPE2_MAGIC) {
+            build_bpe_tokenizer(t, file, vocab_size);
+            fclose(file);
+            return;
+        }
+        fclose(file);
+    }
+    // original llama2.c tokenizer.bin
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
@@ -646,9 +760,18 @@ void free_tokenizer(Tokenizer* t) {
     free(t->vocab);
     free(t->vocab_scores);
     free(t->sorted_vocab);
+    free(t->vocab_len);
+    free(t->is_special);
+    free(t->merge_keys);
+    free(t->merge_rank);
+    free(t->merge_result);
 }
 
 char* decode(Tokenizer* t, int prev_token, int token) {
+    if (t->bpe) {
+        // byte-level BPE: pieces are the raw bytes; special tokens print nothing
+        return t->is_special[token] ? "" : t->vocab[token];
+    }
     char *piece = t->vocab[token];
     // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
     if (prev_token == 1 && piece[0] == ' ') { piece++; }
@@ -668,7 +791,8 @@ void safe_printf(char *piece) {
     if (piece[0] == '\0') { return; }
     if (piece[1] == '\0') {
         unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
+        int ok = isprint(byte_val) || isspace(byte_val) || (g_print_high_bytes && byte_val >= 0x80);
+        if (!ok) {
             return; // bad byte, don't print it
         }
     }
@@ -682,10 +806,195 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+// ----------------------------------------------------------------------------
+// byte-level BPE encoding, matching Hugging Face tokenizers with a
+// Sequence[Digits(individual_digits), ByteLevel(use_regex, no prefix space)] pre-tokenizer
+// (GPT-2 / SmolLM2 style). Text is split into pieces, then each piece's bytes are merged by
+// merge rank; merges never cross piece boundaries.
+
+enum { CC_LETTER, CC_DIGIT, CC_SPACE, CC_OTHER };
+
+// decode one UTF-8 code point at s[i] (s has n bytes); returns its byte length (>= 1).
+// An invalid byte is returned as a 1-byte "code point" with its own value.
+static int utf8_cp(const unsigned char* s, int i, int n, uint32_t* cp) {
+    unsigned char c = s[i];
+    int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+    if (i + len > n) len = 1;
+    for (int k = 1; k < len; k++) if ((s[i + k] & 0xC0) != 0x80) { len = 1; break; }
+    if (len == 1) { *cp = c; return 1; }
+    uint32_t v = c & (0x7F >> len);
+    for (int k = 1; k < len; k++) v = (v << 6) | (s[i + k] & 0x3F);
+    *cp = v;
+    return len;
+}
+
+// Character class for the pre-tokenizer: CC_DIGIT ~ Rust char::is_numeric (each one becomes
+// its own piece), CC_SPACE ~ \s, CC_LETTER ~ \p{L}, CC_OTHER = everything else. Exact for
+// ASCII and Latin-1; common punctuation/symbol/emoji/numeral blocks are mapped explicitly and
+// any other non-ASCII code point counts as a letter (combining marks of non-Latin scripts
+// are the known approximation).
+static int bpe_class(uint32_t cp) {
+    if (cp < 0x80) {
+        if ((cp | 32) >= 'a' && (cp | 32) <= 'z') return CC_LETTER;
+        if (cp >= '0' && cp <= '9') return CC_DIGIT;
+        if (cp == ' ' || (cp >= 9 && cp <= 13)) return CC_SPACE;
+        return CC_OTHER;
+    }
+    if (cp < 0x100) {
+        if (cp == 0x85 || cp == 0xA0) return CC_SPACE;
+        if (cp == 0xB2 || cp == 0xB3 || cp == 0xB9 || (cp >= 0xBC && cp <= 0xBE)) return CC_DIGIT;
+        if (cp == 0xAA || cp == 0xB5 || cp == 0xBA) return CC_LETTER;
+        if (cp >= 0xC0 && cp != 0xD7 && cp != 0xF7) return CC_LETTER;
+        return CC_OTHER; // C1 controls, Latin-1 punctuation and symbols, x and /
+    }
+    if (cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029
+        || cp == 0x202F || cp == 0x205F || cp == 0x3000) return CC_SPACE;
+    if ((cp >= 0x0660 && cp <= 0x0669) || (cp >= 0x06F0 && cp <= 0x06F9) || (cp >= 0x0966 && cp <= 0x096F)
+        || (cp >= 0x2070 && cp <= 0x2079 && cp != 0x2071 && cp != 0x2072 && cp != 0x2073)
+        || (cp >= 0x2080 && cp <= 0x2089) || (cp >= 0x2150 && cp <= 0x2189) || (cp >= 0x2460 && cp <= 0x249B)
+        || (cp >= 0x24EA && cp <= 0x24FF) || (cp >= 0x2776 && cp <= 0x2793) || cp == 0x3007
+        || (cp >= 0x3021 && cp <= 0x3029) || (cp >= 0xFF10 && cp <= 0xFF19)) return CC_DIGIT;
+    if ((cp >= 0x0300 && cp <= 0x036F)                      // combining diacritics (\p{M})
+        || cp == 0x060C || cp == 0x061B || cp == 0x061F || cp == 0x06D4 || cp == 0x0964 || cp == 0x0965
+        || (cp >= 0x2010 && cp <= 0x2027) || (cp >= 0x2030 && cp <= 0x205E) // general punctuation
+        || (cp >= 0x20A0 && cp <= 0x20FF)                   // currency, combining marks for symbols
+        || (cp >= 0x2100 && cp <= 0x214F && cp != 0x2102 && cp != 0x2107 && !(cp >= 0x210A && cp <= 0x2113)
+            && cp != 0x2115 && !(cp >= 0x2119 && cp <= 0x211D) && cp != 0x2124 && cp != 0x2126 && cp != 0x2128
+            && !(cp >= 0x212A && cp <= 0x212D) && !(cp >= 0x212F && cp <= 0x2139) && !(cp >= 0x213C && cp <= 0x213F)
+            && !(cp >= 0x2145 && cp <= 0x2149) && cp != 0x214E)  // letterlike symbols minus the letters
+        || (cp >= 0x2190 && cp <= 0x245F) || (cp >= 0x249C && cp <= 0x24E9) || (cp >= 0x2500 && cp <= 0x2775)
+        || (cp >= 0x2794 && cp <= 0x2BFF) || (cp >= 0x2E00 && cp <= 0x2E7F)  // arrows, math, boxes, dingbats
+        || (cp >= 0x3001 && cp <= 0x3004) || (cp >= 0x3008 && cp <= 0x3020) || (cp >= 0x3030 && cp <= 0x303F)
+        || (cp >= 0xE000 && cp <= 0xF8FF)                   // private use
+        || (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xFE10 && cp <= 0xFE1F) || (cp >= 0xFE30 && cp <= 0xFE6F)
+        || (cp >= 0xFF01 && cp <= 0xFF0F) || (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40)
+        || (cp >= 0xFF5B && cp <= 0xFF65) || (cp >= 0xFFF0 && cp <= 0xFFFF)
+        || (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0xE0000 && cp <= 0xE007F)) return CC_OTHER; // emoji, tags
+    return CC_LETTER;
+}
+
+static int cp_class_at(const unsigned char* s, int i, int n, int* len) {
+    uint32_t cp;
+    *len = utf8_cp(s, i, n, &cp);
+    return bpe_class(cp);
+}
+
+// end of the GPT-2 regex match starting at i, within a digit-free span [i, e):
+// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+static int bpe_regex_match(const unsigned char* s, int i, int e) {
+    int len, k;
+    if (s[i] == '\'' && i + 1 < e) {
+        unsigned char c = s[i + 1];
+        if (c == 's' || c == 't' || c == 'm' || c == 'd') return i + 2;
+        if (i + 2 < e && ((c == 'r' && s[i + 2] == 'e') || (c == 'v' && s[i + 2] == 'e') || (c == 'l' && s[i + 2] == 'l'))) return i + 3;
+    }
+    int start = i;
+    int cls = cp_class_at(s, i, e, &len);
+    if (s[i] == ' ' && i + 1 < e) { // optional single space before letters or symbols
+        int len2, c2 = cp_class_at(s, i + 1, e, &len2);
+        if (c2 == CC_LETTER || c2 == CC_OTHER) { cls = c2; start = i + 1; }
+    }
+    if (cls == CC_LETTER || cls == CC_OTHER) {
+        k = start;
+        while (k < e && cp_class_at(s, k, e, &len) == cls) k += len;
+        return k;
+    }
+    // whitespace run; \s+(?!\S) leaves the last whitespace char for the next token when a
+    // non-space follows (and fails for a single char, falling through to \s+)
+    k = i;
+    int last = i;
+    while (k < e && cp_class_at(s, k, e, &len) == CC_SPACE) { last = k; k += len; }
+    if (k == i) return i + len; // not reached for valid classes; never return an empty match
+    if (k == e) return k;
+    return last > i ? last : k;
+}
+
+static int bpe_merge_lookup(const Tokenizer* t, int a, int b, int* result) {
+    uint64_t key = ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+    int lo = 0, hi = t->n_merges - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (t->merge_keys[mid] < key) lo = mid + 1;
+        else if (t->merge_keys[mid] > key) hi = mid - 1;
+        else { *result = t->merge_result[mid]; return t->merge_rank[mid]; }
+    }
+    return -1;
+}
+
+// apply merges to ids[0..n) in rank order (all occurrences of the best pair, left to right),
+// then append the result to out
+static void bpe_merge_and_emit(const Tokenizer* t, int* ids, int n, int* out, int* n_out) {
+    for (;;) {
+        int best_rank = -1, best_result = 0, best_a = 0, best_b = 0;
+        for (int k = 0; k + 1 < n; k++) {
+            int result, r = bpe_merge_lookup(t, ids[k], ids[k + 1], &result);
+            if (r >= 0 && (best_rank < 0 || r < best_rank)) {
+                best_rank = r; best_result = result; best_a = ids[k]; best_b = ids[k + 1];
+            }
+        }
+        if (best_rank < 0) break;
+        int w = 0;
+        for (int k = 0; k < n; k++) {
+            if (k + 1 < n && ids[k] == best_a && ids[k + 1] == best_b) { ids[w++] = best_result; k++; }
+            else ids[w++] = ids[k];
+        }
+        n = w;
+    }
+    for (int k = 0; k < n; k++) out[(*n_out)++] = ids[k];
+}
+
+// one pre-tokenized piece: bytes -> base tokens -> merges. A byte without a token is dropped
+// and, like in HF, nothing merges across it.
+static void bpe_encode_piece(const Tokenizer* t, const unsigned char* s, int n, int* work, int* out, int* n_out) {
+    int m = 0;
+    for (int k = 0; k < n; k++) {
+        int id = t->byte_token[s[k]];
+        if (id < 0) { bpe_merge_and_emit(t, work, m, out, n_out); m = 0; continue; }
+        work[m++] = id;
+    }
+    bpe_merge_and_emit(t, work, m, out, n_out);
+}
+
+static void bpe_encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens, int* n_tokens) {
+    const unsigned char* s = (const unsigned char*)text;
+    int n = (int)strlen(text);
+    int* work = (int*)malloc((n + 1) * sizeof(int));
+    *n_tokens = 0;
+    if (bos) tokens[(*n_tokens)++] = t->bos_id;
+    int i = 0;
+    while (i < n) {
+        int len, cls = cp_class_at(s, i, n, &len);
+        if (cls == CC_DIGIT) { // Digits(individual_digits=true): every numeric char alone
+            bpe_encode_piece(t, s + i, len, work, tokens, n_tokens);
+            i += len;
+            continue;
+        }
+        int e = i; // the regex runs on the digit-free span up to the next numeric char
+        while (e < n && cp_class_at(s, e, n, &len) != CC_DIGIT) e += len;
+        while (i < e) {
+            int j = bpe_regex_match(s, i, e);
+            bpe_encode_piece(t, s + i, j - i, work, tokens, n_tokens);
+            i = j;
+        }
+    }
+    if (eos) tokens[(*n_tokens)++] = t->eos_id;
+    free(work);
+}
+
+// id of a special token by its text (e.g. "<|im_start|>"), or -1
+static int find_special_token(const Tokenizer* t, const char* text) {
+    if (!t->bpe) return -1;
+    for (int i = 0; i < t->vocab_size; i++) {
+        if (t->is_special[i] && strcmp(t->vocab[i], text) == 0) return i;
+    }
+    return -1;
+}
+
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
+    if (t->bpe) { bpe_encode(t, text, bos, eos, tokens, n_tokens); return; }
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
@@ -1013,8 +1322,9 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1) { break; }
+        // data-dependent terminating condition: the BOS (=1) token delimits sequences;
+        // with a byte-level BPE tokenizer any special token (<|endoftext|>, <|im_end|>...) does
+        if (tokenizer->bpe ? tokenizer->is_special[next] : next == 1) { break; }
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
@@ -1071,9 +1381,27 @@ static void append_encoded(Tokenizer *tokenizer, char *text, int *tokens, int *n
 
 // chat templates: "llama2" = [INST] ... [/INST] (Llama 2 Chat)
 //                 "zephyr" = <|system|>/<|user|>/<|assistant|> turns ended by </s> (TinyLlama-Chat v1.0)
+//                 "chatml" = <|im_start|>role\n...<|im_end|> turns (SmolLM2, needs its BPE2 tokenizer)
+// With no -c, a byte-level BPE tokenizer uses chatml and the original tokenizer uses llama2.
+#define CHATML_DEFAULT_SYSTEM "You are a helpful AI assistant named SmolLM, trained by Hugging Face" // SmolLM2's template default
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps, char *chat_template) {
-    int zephyr = (chat_template != NULL && strcmp(chat_template, "zephyr") == 0);
+    if (chat_template == NULL) chat_template = tokenizer->bpe ? "chatml" : "llama2";
+    int zephyr = strcmp(chat_template, "zephyr") == 0;
+    int chatml = strcmp(chat_template, "chatml") == 0;
+    int eos = tokenizer->eos_id; // ends an assistant turn (2 = </s> for the original tokenizer)
+    int im_start = -1;
+    if (chatml) {
+        im_start = find_special_token(tokenizer, "<|im_start|>");
+        eos = find_special_token(tokenizer, "<|im_end|>");
+        if (im_start < 0 || eos < 0) {
+            fprintf(stderr, "-c chatml needs a tokenizer with <|im_start|> and <|im_end|> (the model's BPE2 tokenizer, via -z)\n");
+            exit(EXIT_FAILURE);
+        }
+    } else if (tokenizer->bpe) {
+        fprintf(stderr, "-c %s needs the original llama2.c tokenizer; use -c chatml with this tokenizer\n", chat_template);
+        exit(EXIT_FAILURE);
+    }
 
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
@@ -1087,7 +1415,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
 
     // start the main loop
     int8_t user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
+    int next = 0;    // will store the next token in the sequence (set before first use)
     int token;       // stores the current token to feed into the transformer
     int pos = 0;     // position in the sequence
     while (pos < steps) {
@@ -1119,11 +1447,11 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                 // </s> must be the real EOS token (2), so the prompt is built piecewise.
                 // Later turns start with "\n" because the previous reply ended with </s>.
                 num_prompt_tokens = 0;
-                if (pos == 0) prompt_tokens[num_prompt_tokens++] = 1; // BOS
+                if (pos == 0) prompt_tokens[num_prompt_tokens++] = tokenizer->bos_id;
                 if (pos == 0 && system_prompt[0] != '\0') {
                     sprintf(rendered_prompt, "<|system|>\n%s", system_prompt);
                     append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
-                    prompt_tokens[num_prompt_tokens++] = 2;
+                    prompt_tokens[num_prompt_tokens++] = eos;
                     sprintf(rendered_prompt, "\n<|user|>\n%s", user_prompt);
                 } else if (pos == 0) {
                     sprintf(rendered_prompt, "<|user|>\n%s", user_prompt);
@@ -1131,8 +1459,30 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     sprintf(rendered_prompt, "\n<|user|>\n%s", user_prompt);
                 }
                 append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
-                prompt_tokens[num_prompt_tokens++] = 2;
+                prompt_tokens[num_prompt_tokens++] = eos;
                 append_encoded(tokenizer, "\n<|assistant|>\n", prompt_tokens, &num_prompt_tokens, scratch_tokens);
+            } else if (chatml) {
+                // [<|im_start|>]system\n{sys}[<|im_end|>]\n[<|im_start|>]user\n{user}[<|im_end|>]\n[<|im_start|>]assistant\n
+                // Special tokens are inserted by id and the text between them is encoded
+                // separately, as HF does. No BOS. Later turns start with "\n": the previous
+                // reply ended with <|im_end|>. Like SmolLM2's template, a default system
+                // prompt is used when none is given.
+                num_prompt_tokens = 0;
+                if (pos == 0) {
+                    prompt_tokens[num_prompt_tokens++] = im_start;
+                    snprintf(rendered_prompt, sizeof(rendered_prompt), "system\n%s",
+                             system_prompt[0] != '\0' ? system_prompt : CHATML_DEFAULT_SYSTEM);
+                    append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                    prompt_tokens[num_prompt_tokens++] = eos;
+                }
+                append_encoded(tokenizer, "\n", prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                prompt_tokens[num_prompt_tokens++] = im_start;
+                snprintf(rendered_prompt, sizeof(rendered_prompt), "user\n%s", user_prompt);
+                append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                prompt_tokens[num_prompt_tokens++] = eos;
+                append_encoded(tokenizer, "\n", prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                prompt_tokens[num_prompt_tokens++] = im_start;
+                append_encoded(tokenizer, "assistant\n", prompt_tokens, &num_prompt_tokens, scratch_tokens);
             } else {
                 // render user/system prompts into the Llama 2 Chat schema
                 if (pos == 0 && system_prompt[0] != '\0') {
@@ -1159,22 +1509,22 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             // otherwise use the next token sampled from previous turn
             token = next;
         }
-        // EOS (=2) token ends the Assistant turn (a forced prompt token can be EOS
-        // too: the zephyr template ends each user/system turn with </s>)
-        if (token == 2 && !forced) { user_turn = 1; }
+        // EOS token (</s> = 2, or <|im_end|> for chatml) ends the Assistant turn (a forced
+        // prompt token can be EOS too: zephyr/chatml end each user/system turn with it)
+        if (token == eos && !forced) { user_turn = 1; }
 
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
         next = sample(sampler, logits);
         pos++;
 
-        if (user_idx >= num_prompt_tokens && next != 2) {
+        if (user_idx >= num_prompt_tokens && next != eos) {
             // the Assistant is responding, so print its output
             char* piece = decode(tokenizer, token, next);
             safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
             fflush(stdout);
         }
-        if (next == 2) { printf("\n"); }
+        if (next == eos) { printf("\n"); }
     }
     printf("\n");
     if (pos >= steps) {
@@ -1201,7 +1551,8 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-    fprintf(stderr, "  -c <string> chat template: llama2|zephyr, default: llama2 (use zephyr for TinyLlama-Chat)\n");
+    fprintf(stderr, "  -c <string> chat template: llama2|zephyr|chatml, default: chatml with a BPE2 tokenizer\n");
+    fprintf(stderr, "              (SmolLM2), else llama2. Use zephyr for TinyLlama-Chat.\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1218,7 +1569,7 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
-    char *chat_template = "llama2"; // llama2|zephyr
+    char *chat_template = NULL; // llama2|zephyr|chatml; NULL = chatml for a BPE2 tokenizer, else llama2
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -1247,8 +1598,9 @@ int main(int argc, char *argv[]) {
     if (steps < 0) steps = 0;
     // in chat mode -n bounds the whole conversation, so default to the full context
     if (strcmp(mode, "chat") == 0 && !steps_given) steps = 0;
-    if (strcmp(chat_template, "llama2") != 0 && strcmp(chat_template, "zephyr") != 0) {
-        fprintf(stderr, "unknown chat template: %s (use llama2 or zephyr)\n", chat_template);
+    if (chat_template != NULL && strcmp(chat_template, "llama2") != 0 && strcmp(chat_template, "zephyr") != 0
+        && strcmp(chat_template, "chatml") != 0) {
+        fprintf(stderr, "unknown chat template: %s (use llama2, zephyr or chatml)\n", chat_template);
         error_usage();
     }
 
@@ -1261,6 +1613,10 @@ int main(int argc, char *argv[]) {
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+#if defined _WIN32
+    // byte-level BPE output is raw UTF-8; make the Windows console display it as such
+    if (tokenizer.bpe) SetConsoleOutputCP(65001);
+#endif
 
     // build the Sampler
     Sampler sampler;

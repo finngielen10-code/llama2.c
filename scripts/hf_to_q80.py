@@ -7,10 +7,19 @@ Q8_0 weights), but needs no torch/transformers and streams one tensor at a time,
 so a 1.1B model converts in a couple of GB of RAM.
 
 Supports grouped-query attention (num_key_value_heads < num_attention_heads),
-bf16/fp16/fp32 weights, and tied or untied classifiers.
+bf16/fp16/fp32 weights, tied or untied classifiers, and any rope_theta.
+
+A rope_theta other than Llama 2's 10000 is stored in the header padding and the file
+is marked version 3, so an older runq.c refuses it ("Bad version") instead of silently
+using the wrong RoPE. With theta 10000 the output is the plain version-2 file.
+
+--seq-len caps the context length written into the header (default: the model's
+max_position_embeddings, capped at 2048). runq.c sizes its KV cache from it:
+n_layers * seq_len * kv_dim * 8 bytes (SmolLM2-1.7B at 8192 would need 3.2 GB).
 
 Usage:
     python scripts/hf_to_q80.py hf/TinyLlama-1.1B-Chat-v1.0 tinyllama_chat_q80.bin
+    python scripts/hf_to_q80.py hf/SmolLM2-1.7B-Instruct smollm2_1.7b_q80.bin --seq-len 4096
 """
 import glob
 import json
@@ -85,11 +94,16 @@ def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     model_dir, out_path = sys.argv[1], sys.argv[2]
+    seq_cap = 2048
+    if len(sys.argv) > 3:
+        if len(sys.argv) != 5 or sys.argv[3] != "--seq-len" or not sys.argv[4].isdigit() or int(sys.argv[4]) < 1:
+            sys.exit(__doc__)
+        seq_cap = int(sys.argv[4])
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
-    # runq.c implements exactly the Llama 2 block: no biases, SiLU gate, plain RoPE with
-    # theta 10000, RMSNorm eps 1e-5. Anything else would convert "fine" and then produce
-    # garbage, so refuse it.
+    # runq.c implements exactly the Llama block: no biases, SiLU gate, plain (unscaled) RoPE,
+    # RMSNorm eps 1e-5. Anything else would convert "fine" and then produce garbage, so
+    # refuse it.
     problems = []
     if cfg.get("model_type") != "llama":
         problems.append(f"model_type is {cfg.get('model_type')!r}, not 'llama'")
@@ -99,8 +113,9 @@ def main():
         problems.append("attention/MLP biases are not supported")
     if cfg.get("rope_scaling"):
         problems.append(f"rope_scaling {cfg.get('rope_scaling')!r} is not supported")
-    if cfg.get("rope_theta", 10000.0) != 10000.0:
-        problems.append(f"rope_theta is {cfg.get('rope_theta')}, runq.c hardcodes 10000")
+    rope_theta = float(cfg.get("rope_theta", 10000.0))
+    if not rope_theta > 0:
+        problems.append(f"rope_theta is {cfg.get('rope_theta')}")
     if abs(cfg.get("rms_norm_eps", 1e-5) - 1e-5) > 1e-9:
         problems.append(f"rms_norm_eps is {cfg.get('rms_norm_eps')}, runq.c hardcodes 1e-5")
     if problems:
@@ -112,7 +127,7 @@ def main():
     n_heads = cfg["num_attention_heads"]
     n_kv_heads = cfg.get("num_key_value_heads") or n_heads
     vocab_size = cfg["vocab_size"]
-    max_seq_len = cfg["max_position_embeddings"]
+    max_seq_len = min(cfg["max_position_embeddings"], seq_cap)
 
     head_size = dim // n_heads
     kv_dim = n_kv_heads * head_size
@@ -156,11 +171,14 @@ def main():
             sys.exit(f"{name} has shape {got}, expected {shape} from config.json")
 
     with open(out_path, "wb") as out:
+        default_rope = rope_theta == 10000.0
         out.write(struct.pack("I", 0x616b3432))  # "ak42"
-        out.write(struct.pack("i", 2))           # version
+        out.write(struct.pack("i", 2 if default_rope else 3))  # version (3 = has rope_theta)
         out.write(struct.pack("iiiiiii", dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len))
         out.write(struct.pack("B", int(shared)))
         out.write(struct.pack("i", gs))
+        if not default_rope:
+            out.write(struct.pack("f", rope_theta))  # header bytes 41..44
         out.write(b"\0" * (256 - out.tell()))
 
         # fp32 norms
