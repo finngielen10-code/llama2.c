@@ -14,6 +14,17 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+// AVX2 int8 matmul kernel (-march=native on an AVX2/FMA CPU); plain C otherwise.
+// Both give bit-identical results: the int8 dot products are exact integers and the
+// float math per row is done in the same order.
+#if defined(__AVX2__) && defined(__FMA__)
+    #include <immintrin.h>
+    #define RUNQ_SIMD 1
+#endif
+
+// thread pool (pool_init / pool_parallel_for); same design as run.c's inline pool
+#include "pool.h"
+
 // ----------------------------------------------------------------------------
 // Globals
 int GS = 0; // group size global for quantization of the weights
@@ -73,6 +84,7 @@ typedef struct {
     float *v; // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
+    float *rope_cos, *rope_sin; // RoPE rotation for the current position, (dim/2,), filled once per token
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -103,11 +115,13 @@ void malloc_run_state(RunState* s, Config* p) {
     s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
+    s->rope_cos = calloc(p->dim / 2, sizeof(float));
+    s->rope_sin = calloc(p->dim / 2, sizeof(float));
     s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
+     || !s->k || !s->v || !s->att || !s->logits || !s->rope_cos || !s->rope_sin || !s->key_cache
      || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
@@ -129,6 +143,8 @@ void free_run_state(RunState* s) {
     free(s->v);
     free(s->att);
     free(s->logits);
+    free(s->rope_cos);
+    free(s->rope_sin);
     free(s->key_cache);
     free(s->value_cache);
 }
@@ -238,8 +254,15 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (fread(&group_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
     GS = group_size; // set as global, as it will be used in many places
     // figure out the file size
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
+    // get the file size in bytes; 64-bit on Windows, where ftell's long is 32 bits and
+    // would break checkpoints of 2 GB or more
+#if defined _WIN32
+    _fseeki64(file, 0, SEEK_END);
+    *file_size = _ftelli64(file);
+#else
+    fseek(file, 0, SEEK_END);
+    *file_size = ftell(file);
+#endif
     fclose(file);
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
@@ -314,30 +337,150 @@ void softmax(float* x, int size) {
     }
 }
 
+
+// ----------------------------------------------------------------------------
+
+// one output row, exactly as the original scalar loop computes it
+static inline float matmul_row(QuantizedTensor *x, QuantizedTensor *w, int n, int i) {
+    float val = 0.0f;
+    int32_t ival = 0;
+    int in = i * n;
+    // do the matmul in groups of GS
+    for (int j = 0; j <= n - GS; j += GS) {
+        for (int k = 0; k < GS; k++) {
+            ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+        }
+        val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+        ival = 0;
+    }
+    return val;
+}
+
+#ifdef RUNQ_SIMD
+// acc (8 x int32) += dot products of 32 int8 pairs, 4 per lane. Integer math, so exact.
+static inline __m256i dot_i8(__m256i acc, __m256i x, __m256i w) {
+#ifdef __AVXVNNIINT8__
+    return _mm256_dpbssd_epi32(acc, x, w);              // signed x signed (Lunar Lake, Arrow Lake)
+#else
+    // |x| (unsigned) * (w with x's sign); no int16 saturation since |x|,|w| <= 127
+    __m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(x, x), _mm256_sign_epi8(w, x));
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_set1_epi16(1)));
+#endif
+}
+
+// lane r of the result = sum of the 8 lanes of a[r]
+static inline __m256i hsum8x8(const __m256i *a) {
+    __m256i s01 = _mm256_hadd_epi32(a[0], a[1]);
+    __m256i s23 = _mm256_hadd_epi32(a[2], a[3]);
+    __m256i s45 = _mm256_hadd_epi32(a[4], a[5]);
+    __m256i s67 = _mm256_hadd_epi32(a[6], a[7]);
+    __m256i s0123 = _mm256_hadd_epi32(s01, s23);
+    __m256i s4567 = _mm256_hadd_epi32(s45, s67);
+    return _mm256_add_epi32(_mm256_permute2x128_si256(s0123, s4567, 0x20),
+                            _mm256_permute2x128_si256(s0123, s4567, 0x31));
+}
+
+// 8 rows i0..i0+7. Per group: exact int32 dot products, then per lane the same
+// float ops in the same order as matmul_row: (float)ival * ws, * xs, val + that.
+// fp-contract=off keeps GCC from fusing those into an FMA (the scalar code isn't fused).
+__attribute__((optimize("fp-contract=off")))
+static void matmul_rows8(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int i0) {
+    int ng = n / GS;
+    const int8_t *wq = w->q + (size_t)i0 * n;
+    const float *ws = w->s + (size_t)i0 * ng;
+    __m256i sidx = _mm256_mullo_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32(ng));
+    __m256 val = _mm256_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        __m256i acc[8];
+        for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_si256();
+        for (int k = g * GS; k < (g + 1) * GS; k += 32) {
+            __m256i xv = _mm256_loadu_si256((const __m256i*)(x->q + k));
+            for (int r = 0; r < 8; r++)
+                acc[r] = dot_i8(acc[r], xv, _mm256_loadu_si256((const __m256i*)(wq + (size_t)r * n + k)));
+        }
+        __m256 t = _mm256_cvtepi32_ps(hsum8x8(acc));
+        t = _mm256_mul_ps(t, _mm256_i32gather_ps(ws + g, sidx, 4));
+        t = _mm256_mul_ps(t, _mm256_set1_ps(x->s[g]));
+        val = _mm256_add_ps(val, t);
+    }
+    _mm256_storeu_ps(xout + i0, val);
+}
+#endif
+
+// rows [r0, r1) of W (d,n) @ x (n,) -> xout
+static void matmul_range(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int r0, int r1) {
+    int i = r0;
+#ifdef RUNQ_SIMD
+    if (GS % 32 == 0) {
+        for (; i + 8 <= r1; i += 8) matmul_rows8(xout, x, w, n, i);
+    }
+#endif
+    for (; i < r1; i++) xout[i] = matmul_row(x, w, n, i);
+}
+
+// rows per scheduled task (multiple of 8). Tasks are handed out dynamically, so the
+// slower LP E-cores just take fewer of them instead of holding up the P-cores.
+#ifndef MM_TASK_ROWS
+#define MM_TASK_ROWS 64
+#endif
+
+typedef struct { float* xout; QuantizedTensor *x, *w; int n, d; } MMJob;
+
+static void matmul_task(void* ctx, int t) {
+    MMJob *j = (MMJob*)ctx;
+    int r0 = t * MM_TASK_ROWS;
+    int r1 = r0 + MM_TASK_ROWS < j->d ? r0 + MM_TASK_ROWS : j->d;
+    matmul_range(j->xout, j->x, j->w, j->n, r0, r1);
+}
+
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
+    MMJob job = { xout, x, w, n, d };
+    pool_parallel_for(matmul_task, &job, (d + MM_TASK_ROWS - 1) / MM_TASK_ROWS);
+}
 
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
+// one attention head (pool task), same arithmetic as the original per-head loop body
+typedef struct { RunState *s; int seq_len, loff, pos, head_size, kv_dim, kv_mul; } AttnJob;
 
-        float val = 0.0f;
-        int32_t ival = 0;
-        int in = i * n;
-
-        // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
-            }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
+static void attention_head(void* ctx, int h) {
+    AttnJob *j = (AttnJob*)ctx;
+    RunState *s = j->s;
+    int pos = j->pos, head_size = j->head_size, kv_dim = j->kv_dim, loff = j->loff;
+    // get the query vector for this head
+    float* q = s->q + h * head_size;
+    // attention scores for this head
+    float* att = s->att + h * j->seq_len;
+    // iterate over all timesteps, including the current one
+    for (int t = 0; t <= pos; t++) {
+        // get the key vector for this head and at this timestep
+        float* k = s->key_cache + loff + t * kv_dim + (h / j->kv_mul) * head_size;
+        // calculate the attention score as the dot product of q and k
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++) {
+            score += q[i] * k[i];
         }
+        score /= sqrtf(head_size);
+        // save the score to the attention buffer
+        att[t] = score;
+    }
 
-        xout[i] = val;
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
+
+    // weighted sum of the values, store back into xb
+    float* xb = s->xb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+        // get the value vector for this head and at this timestep
+        float* v = s->value_cache + loff + t * kv_dim + (h / j->kv_mul) * head_size;
+        // get the attention weight for this timestep
+        float a = att[t];
+        // accumulate the weighted value into xb
+        for (int i = 0; i < head_size; i++) {
+            xb[i] += a * v[i];
+        }
     }
 }
 
@@ -357,6 +500,16 @@ float* forward(Transformer* transformer, int token, int pos) {
     // copy the token embedding into x
     memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
 
+    // RoPE rotation for this position: same expressions as the original per-layer loop,
+    // but evaluated once per token instead of once per layer (identical values)
+    for (int i = 0; i < dim; i+=2) {
+        int head_dim = i % head_size;
+        float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+        float val = pos * freq;
+        s->rope_cos[i / 2] = cosf(val);
+        s->rope_sin[i / 2] = sinf(val);
+    }
+
     // forward all the layers
     for(int l = 0; l < p->n_layers; l++) {
 
@@ -371,11 +524,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = s->rope_cos[i / 2];
+            float fci = s->rope_sin[i / 2];
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
             for (int v = 0; v < rotn; v++) {
                 float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
@@ -394,44 +544,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
 
         // multihead attention. iterate over all heads
-        int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
-            }
-        }
+        AttnJob aj = { s, p->seq_len, loff, pos, head_size, kv_dim, kv_mul };
+        pool_parallel_for(attention_head, &aj, p->n_heads);
 
         // final matmul to get the output of the attention
         quantize(&s->xq, s->xb, dim);
@@ -737,7 +851,10 @@ int compare(const void* a, const void* b) {
     ProbIndex* b_ = (ProbIndex*) b;
     if (a_->prob > b_->prob) return -1;
     if (a_->prob < b_->prob) return 1;
-    return 0;
+    // ties: lower token id first. qsort isn't stable, so without this the order of equal
+    // probabilities depends on the input array, and sample_topp's threshold shortcut
+    // (which sorts a smaller array) could pick a different token than a full sort
+    return (a_->index > b_->index) - (a_->index < b_->index);
 }
 
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
@@ -751,12 +868,26 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
     const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
-            n0++;
+    // Speedup (same result): the truncated list is a prefix of the descending sort, i.e. it
+    // only holds the largest probabilities. So first gather just the tokens above a much
+    // higher threshold; if those already sum past topp (with a margin for summation-order
+    // rounding), the prefix lies entirely inside that small set and only it needs sorting.
+    // Otherwise lower the threshold, ending at the original cutoff.
+    static const float thresholds[] = { 1e-2f, 1e-3f, 1e-4f };
+    for (int t = 0; t <= 3; t++) {
+        float th = t < 3 ? thresholds[t] : cutoff;
+        if (th < cutoff) th = cutoff;
+        n0 = 0;
+        float mass = 0.0f;
+        for (int i = 0; i < n; i++) {
+            if (probabilities[i] >= th) {
+                probindex[n0].index = i;
+                probindex[n0].prob = probabilities[i];
+                mass += probabilities[i];
+                n0++;
+            }
         }
+        if (th == cutoff || mass > topp + 1e-3f) break;
     }
     qsort(probindex, n0, sizeof(ProbIndex), compare);
 
@@ -908,6 +1039,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 void read_stdin(const char* guide, char* buffer, size_t bufsize) {
     // read a line from stdin, up to but not including \n
     printf("%s", guide);
+    buffer[0] = '\0'; // on EOF/error leave an empty string, not the previous line
     if (fgets(buffer, bufsize, stdin) != NULL) {
         size_t len = strlen(buffer);
         if (len > 0 && buffer[len - 1] == '\n') {
@@ -922,8 +1054,18 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
+// encode text (no BOS/EOS) and append its tokens to tokens[*n]
+static void append_encoded(Tokenizer *tokenizer, char *text, int *tokens, int *n, int *scratch) {
+    int k = 0;
+    encode(tokenizer, text, 0, 0, scratch, &k);
+    for (int i = 0; i < k; i++) tokens[(*n)++] = scratch[i];
+}
+
+// chat templates: "llama2" = [INST] ... [/INST] (Llama 2 Chat)
+//                 "zephyr" = <|system|>/<|user|>/<|assistant|> turns ended by </s> (TinyLlama-Chat v1.0)
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          char *cli_user_prompt, char *cli_system_prompt, int steps) {
+          char *cli_user_prompt, char *cli_system_prompt, int steps, char *chat_template) {
+    int zephyr = (chat_template != NULL && strcmp(chat_template, "zephyr") == 0);
 
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
@@ -931,7 +1073,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     char user_prompt[512];
     char rendered_prompt[1152];
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+    int* prompt_tokens = (int*)malloc(4096 * sizeof(int));
+    int* scratch_tokens = (int*)malloc(2048 * sizeof(int));
     int user_idx;
 
     // start the main loop
@@ -952,42 +1095,66 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
                 } else {
                     // system prompt was passed in, use it
-                    strcpy(system_prompt, cli_system_prompt);
+                    snprintf(system_prompt, sizeof(system_prompt), "%s", cli_system_prompt); // bounded: -y can be long
                 }
             }
             // get the user prompt
             if (pos == 0 && cli_user_prompt != NULL) {
                 // user prompt for position 0 was passed in, use it
-                strcpy(user_prompt, cli_user_prompt);
+                snprintf(user_prompt, sizeof(user_prompt), "%s", cli_user_prompt); // bounded: -i can be long
             } else {
                 // otherwise get user prompt from stdin
                 read_stdin("User: ", user_prompt, sizeof(user_prompt));
+                if (feof(stdin) && user_prompt[0] == '\0') { printf("\n"); break; } // stdin closed: end the chat
             }
-            // render user/system prompts into the Llama 2 Chat schema
-            if (pos == 0 && system_prompt[0] != '\0') {
-                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
-                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
+            if (zephyr) {
+                // <s><|system|>\n{sys}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n
+                // </s> must be the real EOS token (2), so the prompt is built piecewise.
+                // Later turns start with "\n" because the previous reply ended with </s>.
+                num_prompt_tokens = 0;
+                if (pos == 0) prompt_tokens[num_prompt_tokens++] = 1; // BOS
+                if (pos == 0 && system_prompt[0] != '\0') {
+                    sprintf(rendered_prompt, "<|system|>\n%s", system_prompt);
+                    append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                    prompt_tokens[num_prompt_tokens++] = 2;
+                    sprintf(rendered_prompt, "\n<|user|>\n%s", user_prompt);
+                } else if (pos == 0) {
+                    sprintf(rendered_prompt, "<|user|>\n%s", user_prompt);
+                } else {
+                    sprintf(rendered_prompt, "\n<|user|>\n%s", user_prompt);
+                }
+                append_encoded(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens, scratch_tokens);
+                prompt_tokens[num_prompt_tokens++] = 2;
+                append_encoded(tokenizer, "\n<|assistant|>\n", prompt_tokens, &num_prompt_tokens, scratch_tokens);
             } else {
-                char user_template[] = "[INST] %s [/INST]";
-                sprintf(rendered_prompt, user_template, user_prompt);
+                // render user/system prompts into the Llama 2 Chat schema
+                if (pos == 0 && system_prompt[0] != '\0') {
+                    char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
+                    sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
+                } else {
+                    char user_template[] = "[INST] %s [/INST]";
+                    sprintf(rendered_prompt, user_template, user_prompt);
+                }
+                // encode the rendered prompt into tokens
+                encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
             }
-            // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
             user_idx = 0; // reset the user index
             user_turn = 0;
             printf("Assistant: ");
         }
 
         // determine the token to pass into the transformer next
-        if (user_idx < num_prompt_tokens) {
+        int forced = user_idx < num_prompt_tokens;
+        if (forced) {
             // if we are still processing the input prompt, force the next prompt token
             token = prompt_tokens[user_idx++];
         } else {
             // otherwise use the next token sampled from previous turn
             token = next;
         }
-        // EOS (=2) token ends the Assistant turn
-        if (token == 2) { user_turn = 1; }
+        // EOS (=2) token ends the Assistant turn (a forced prompt token can be EOS
+        // too: the zephyr template ends each user/system turn with </s>)
+        if (token == 2 && !forced) { user_turn = 1; }
 
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
@@ -1003,7 +1170,11 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         if (next == 2) { printf("\n"); }
     }
     printf("\n");
+    if (pos >= steps) {
+        fprintf(stderr, "[chat ended: the conversation reached the %d-token limit (-n)]\n", steps);
+    }
     free(prompt_tokens);
+    free(scratch_tokens);
 }
 
 
@@ -1023,6 +1194,7 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -c <string> chat template: llama2|zephyr, default: llama2 (use zephyr for TinyLlama-Chat)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1034,10 +1206,12 @@ int main(int argc, char *argv[]) {
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
+    int steps_given = 0;        // was -n passed? (chat defaults to the full context instead)
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    char *chat_template = "llama2"; // llama2|zephyr
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -1050,11 +1224,12 @@ int main(int argc, char *argv[]) {
         if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
         else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); steps_given = 1; }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'c') { chat_template = argv[i + 1]; }
         else { error_usage(); }
     }
 
@@ -1063,10 +1238,17 @@ int main(int argc, char *argv[]) {
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
+    // in chat mode -n bounds the whole conversation, so default to the full context
+    if (strcmp(mode, "chat") == 0 && !steps_given) steps = 0;
+    if (strcmp(chat_template, "llama2") != 0 && strcmp(chat_template, "zephyr") != 0) {
+        fprintf(stderr, "unknown chat template: %s (use llama2 or zephyr)\n", chat_template);
+        error_usage();
+    }
 
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    pool_init(); // start the worker threads once, before the first forward pass
     if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // override to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
@@ -1081,7 +1263,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps, chat_template);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

@@ -171,10 +171,16 @@ int munlock(const void *addr, size_t len)
     return -1;
 }
 
-// Portable clock_gettime function for Windows
+// Portable clock_gettime function for Windows. run.c only uses it to time intervals, so it
+// is backed by the high-resolution performance counter: GetTickCount() only advances every
+// ~15.6 ms, which quantized the reported tok/s into ~4% steps on a ~0.4 s run.
 int win_clock_gettime(int clk_id, struct timespec *tp) {
-    uint32_t ticks = GetTickCount();
-    tp->tv_sec = ticks / 1000;
-    tp->tv_nsec = (ticks % 1000) * 1000000;
+    (void)clk_id;
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    tp->tv_sec = (time_t)(now.QuadPart / freq.QuadPart);
+    tp->tv_nsec = (long)((now.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
     return 0;
 }
