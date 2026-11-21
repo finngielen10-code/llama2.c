@@ -17,40 +17,15 @@
 
 // Portability switches. The fast paths need: AVX2+FMA (-march=native on x86) for the
 // SIMD kernels, and C11 atomics + threads (gcc/clang) for the thread pool. Builds
-// without them (plain `make`, MSVC, ARM) use the plain-C kernels / run single-threaded.
+// without them (plain `make`, MSVC, ARM) use the plain-C kernels, and without the pool
+// run tasks through OpenMP if enabled, else on the calling thread (see pool.h).
 #if defined __AVX2__ && defined __FMA__
     #define USE_AVX2 1
 #else
     #define USE_AVX2 0
 #endif
-#ifndef USE_POOL
-    #if defined _MSC_VER || defined __STDC_NO_ATOMICS__
-        #define USE_POOL 0
-    #else
-        #define USE_POOL 1
-    #endif
-#endif
-#if defined __x86_64__ || defined __i386__ || defined _M_X64 || defined _M_IX86
-    #include <immintrin.h>
-    #define CPU_RELAX() _mm_pause()
-#elif defined __aarch64__ || defined __arm__
-    #define CPU_RELAX() __asm__ __volatile__("yield")
-#else
-    #define CPU_RELAX() ((void)0)
-#endif
-#ifdef _OPENMP
-    #include <omp.h>
-#endif
-#if USE_POOL
-    #include <stdatomic.h>
-    #if defined _WIN32
-        #define POOL_YIELD() SwitchToThread()
-    #else
-        #include <pthread.h>
-        #include <sched.h>
-        #define POOL_YIELD() sched_yield()
-    #endif
-#endif
+// thread pool (USE_POOL, pool_init, pool_parallel_for; also pulls in <immintrin.h> on x86)
+#include "pool.h"
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -271,9 +246,6 @@ void softmax(float* x, int size) {
 #ifndef POOL_CHUNK_ROWS
 #define POOL_CHUNK_ROWS 64    // rows grabbed per work-steal step (multiple of 4)
 #endif
-#ifndef POOL_SPIN_BEFORE_YIELD
-#define POOL_SPIN_BEFORE_YIELD 200000
-#endif
 
 #if USE_AVX2
 static inline float hsum256(__m256 v) {
@@ -441,121 +413,6 @@ static inline void mm_rows(float* xout, const float* x, const float* w, int n, i
     else matmul_rows(xout, x, w, n, r0, r1);
 }
 
-// generic job: ntasks independent tasks, claimed dynamically by the caller and the workers
-typedef void (*pool_task_fn)(void* ctx, int task);
-static int pool_nthreads = 1;            // including the calling thread
-
-#if USE_POOL
-static pool_task_fn pool_fn;
-static void* pool_ctx;
-static int pool_ntasks;
-static atomic_int pool_gen;              // bumped to publish a new job
-static atomic_int pool_next_task;        // work-stealing cursor
-static atomic_int pool_active;           // workers still running the current job
-
-static void pool_run_job(void) {
-    for (;;) {
-        int t = atomic_fetch_add_explicit(&pool_next_task, 1, memory_order_relaxed);
-        if (t >= pool_ntasks) break;
-        pool_fn(pool_ctx, t);
-    }
-}
-
-// Windows 11 on hybrid CPUs: opt the calling thread out of power throttling (EcoQoS) so
-// Thread Director prefers performance cores for it. No-op elsewhere.
-static void set_high_qos(void) {
-#if defined _WIN32 && defined THREAD_POWER_THROTTLING_CURRENT_VERSION
-    THREAD_POWER_THROTTLING_STATE st;
-    memset(&st, 0, sizeof(st));
-    st.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-    st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-    st.StateMask = 0; // throttling off
-    // resolved at runtime: the API is Windows 8+ and not declared under win.h's _WIN32_WINNT
-    typedef BOOL (WINAPI *SetThreadInformationFn)(HANDLE, int, LPVOID, DWORD);
-    SetThreadInformationFn fn = (SetThreadInformationFn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadInformation");
-    if (fn) fn(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof(st));
-#endif
-}
-
-static void* pool_worker(void* arg) {
-    (void)arg;
-    set_high_qos();
-    int seen = atomic_load_explicit(&pool_gen, memory_order_acquire);
-    for (;;) {
-        int g, spins = 0;
-        while ((g = atomic_load_explicit(&pool_gen, memory_order_acquire)) == seen) {
-            CPU_RELAX();
-            if (++spins >= POOL_SPIN_BEFORE_YIELD) { POOL_YIELD(); spins = 0; }
-        }
-        seen = g;
-        pool_run_job();
-        atomic_fetch_sub_explicit(&pool_active, 1, memory_order_release);
-    }
-    return NULL;
-}
-#if defined _WIN32
-static DWORD WINAPI pool_worker_win(LPVOID arg) { pool_worker(arg); return 0; }
-#endif
-
-static int num_procs(void) {
-#if defined _OPENMP
-    return omp_get_num_procs();
-#elif defined _WIN32
-    SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors;
-#else
-    long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1;
-#endif
-}
-
-static void pool_init(void) {
-    static int initialized = 0;
-    if (initialized) return;
-    initialized = 1;
-    set_high_qos();
-    // Default to half the logical CPUs + 1. Spinning on every logical CPU oversubscribes
-    // (OS work preempts a spinner mid-job and everyone waits); on a Core Ultra 5 226V
-    // (4P + 4LPE) 5 threads measured best: 4 -> ~530, 5 -> ~575, 7-8 -> fast but erratic tok/s.
-    // OMP_NUM_THREADS overrides this.
-#ifdef _OPENMP
-    int nt = getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : num_procs() / 2 + 1;
-#else
-    int nt = getenv("OMP_NUM_THREADS") ? atoi(getenv("OMP_NUM_THREADS")) : num_procs() / 2 + 1;
-#endif
-    if (nt < 1) nt = 1;
-    pool_nthreads = nt;
-    for (int t = 1; t < nt; t++) {
-#if defined _WIN32
-        HANDLE th = CreateThread(NULL, 0, pool_worker_win, NULL, 0, NULL);
-        if (!th) { pool_nthreads = t; break; }
-        CloseHandle(th);
-#else
-        pthread_t th;
-        if (pthread_create(&th, NULL, pool_worker, NULL) != 0) { pool_nthreads = t; break; }
-        pthread_detach(th);
-#endif
-    }
-}
-
-// runs fn(ctx, 0..ntasks-1) across the pool; returns when all tasks are done
-static void pool_parallel_for(pool_task_fn fn, void* ctx, int ntasks) {
-    if (pool_nthreads <= 1 || ntasks <= 1) {
-        for (int t = 0; t < ntasks; t++) fn(ctx, t);
-        return;
-    }
-    pool_fn = fn; pool_ctx = ctx; pool_ntasks = ntasks;
-    atomic_store_explicit(&pool_next_task, 0, memory_order_relaxed);
-    atomic_store_explicit(&pool_active, pool_nthreads - 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&pool_gen, 1, memory_order_release); // publish
-    pool_run_job();
-    while (atomic_load_explicit(&pool_active, memory_order_acquire) != 0) { CPU_RELAX(); }
-}
-#else
-// no atomics/threads available (e.g. MSVC): run everything on the calling thread
-static void pool_init(void) {}
-static void pool_parallel_for(pool_task_fn fn, void* ctx, int ntasks) {
-    for (int t = 0; t < ntasks; t++) fn(ctx, t);
-}
-#endif
 
 typedef struct { float* xout; const float* x; const float* w; int n; int d; } MatmulJob;
 
