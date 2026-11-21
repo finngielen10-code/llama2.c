@@ -1036,16 +1036,24 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     free(prompt_tokens);
 }
 
-void read_stdin(const char* guide, char* buffer, size_t bufsize) {
-    // read a line from stdin, up to but not including \n
+int read_stdin(const char* guide, char* buffer, size_t bufsize) {
+    // read a line from stdin, up to but not including \n. Returns 0 on EOF or a read error
+    // (buffer is then empty, not the previous line), 1 otherwise.
     printf("%s", guide);
-    buffer[0] = '\0'; // on EOF/error leave an empty string, not the previous line
-    if (fgets(buffer, bufsize, stdin) != NULL) {
-        size_t len = strlen(buffer);
-        if (len > 0 && buffer[len - 1] == '\n') {
-            buffer[len - 1] = '\0'; // strip newline
-        }
+    fflush(stdout);
+    buffer[0] = '\0';
+    if (fgets(buffer, bufsize, stdin) == NULL) return 0;
+    size_t len = strlen(buffer);
+    if (len > 0 && buffer[len - 1] == '\n') {
+        buffer[len - 1] = '\0'; // strip newline
+    } else if (!feof(stdin)) {
+        // line longer than the buffer: drop the rest instead of leaving it in stdin,
+        // where the next read would send it as a separate message
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) {}
+        fprintf(stderr, "[input truncated to %d characters]\n", (int)(bufsize - 1));
     }
+    return 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -1081,7 +1089,6 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int8_t user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
-    int prev_token;
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
@@ -1104,8 +1111,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                 snprintf(user_prompt, sizeof(user_prompt), "%s", cli_user_prompt); // bounded: -i can be long
             } else {
                 // otherwise get user prompt from stdin
-                read_stdin("User: ", user_prompt, sizeof(user_prompt));
-                if (feof(stdin) && user_prompt[0] == '\0') { printf("\n"); break; } // stdin closed: end the chat
+                // stdin closed or failing: end the chat
+                if (!read_stdin("User: ", user_prompt, sizeof(user_prompt))) { printf("\n"); break; }
             }
             if (zephyr) {
                 // <s><|system|>\n{sys}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n

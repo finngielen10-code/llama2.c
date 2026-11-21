@@ -106,6 +106,10 @@ static void* pool_worker(void* arg) {
     // the main thread would wait forever (seen as a process hanging at ~100% CPU).
     // pool_init also waits for all workers to start, so this is belt and braces.
     int seen = 0;
+#ifdef POOL_TEST_WORKER_START_DELAY_MS
+    // tests/pool_test.c: simulate the OS starting this worker late
+    for (int i = 0; i < POOL_TEST_WORKER_START_DELAY_MS; i++) POOL_SLEEP();
+#endif
     atomic_fetch_add_explicit(&pool_started, 1, memory_order_release);
     for (;;) {
         int g, spins = 0, yields = 0;
